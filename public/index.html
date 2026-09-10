@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Eaglercraft : Connected Client</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <!-- ================= MENU SCREEN ================= -->
+  <div id="menu-screen" class="screen active">
+    <div class="menu-panel">
+      <h1 class="title">Eaglercraft</h1>
+      <h2 class="subtitle">Connected Client</h2>
+
+      <div class="menu-section">
+        <label for="username-input">Pseudo</label>
+        <input id="username-input" type="text" maxlength="16" placeholder="Steve" autocomplete="off">
+      </div>
+
+      <div class="menu-section">
+        <div class="section-header">
+          <span>Serveurs</span>
+          <button id="add-server-btn" class="btn small">+ Ajouter</button>
+        </div>
+        <ul id="server-list" class="server-list"></ul>
+        <p id="no-servers" class="muted">Aucun serveur. Clique sur « + Ajouter » pour commencer.</p>
+      </div>
+
+      <div id="server-form" class="server-form hidden">
+        <label for="server-name">Nom</label>
+        <input id="server-name" type="text" maxlength="32" placeholder="Mon serveur">
+        <label for="server-host">Adresse</label>
+        <input id="server-host" type="text" maxlength="255" placeholder="163.5.201.7">
+        <label for="server-port">Port</label>
+        <input id="server-port" type="number" min="1" max="65535" value="25565">
+        <div class="form-actions">
+          <button id="server-form-cancel" class="btn small">Annuler</button>
+          <button id="server-form-save" class="btn small primary">Enregistrer</button>
+        </div>
+      </div>
+
+      <div class="menu-footer">
+        <span class="muted">Client web Minecraft — piloté par un bot Mineflayer</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ================= CONNECTING / QUEUE SCREEN ================= -->
+  <div id="loading-screen" class="screen">
+    <div class="loading-panel">
+      <div class="spinner"></div>
+      <h2 id="loading-title">Connexion…</h2>
+      <p id="loading-detail" class="muted">Connexion au serveur…</p>
+      <button id="loading-cancel" class="btn">Annuler</button>
+    </div>
+  </div>
+
+  <!-- ================= GAME SCREEN ================= -->
+  <div id="game-screen" class="screen">
+    <canvas id="game-canvas"></canvas>
+
+    <!-- HUD -->
+    <div id="hud" class="hidden">
+      <div id="crosshair">+</div>
+      <div id="debug-info">…</div>
+      <div id="hearts-bar">
+        <div id="hearts"></div>
+      </div>
+      <div id="chat-area">
+        <div id="chat-messages"></div>
+        <div id="chat-input-row" class="hidden">
+          <input id="chat-input" type="text" maxlength="256" placeholder="Message… (Entrée pour envoyer)">
+        </div>
+      </div>
+      <div id="hotbar"></div>
+    </div>
+  </div>
+
+  <!-- ================= ERROR SCREEN ================= -->
+  <div id="error-screen" class="screen">
+    <div class="error-panel">
+      <h2 id="error-title">Erreur</h2>
+      <p id="error-detail"></p>
+      <button id="error-back" class="btn primary">Retour au menu</button>
+    </div>
+  </div>
+
+  <script src="js/chunkCodec.js"></script>
+  <script src="js/net.js"></script>
+  <script src="js/menu.js"></script>
+  <script src="js/game.js"></script>
+  <script src="js/main.js"></script>
+  <script type="module" src="js/renderer.js"></script>
+</body>
+</html>

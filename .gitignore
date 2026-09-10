@@ -141,3 +141,12 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# Eaglercraft: Connected Client
+node_modules/
+resourcepack/
+*.log
+.DS_Store
+
+ressourcepack/
+ressourcepack.zip

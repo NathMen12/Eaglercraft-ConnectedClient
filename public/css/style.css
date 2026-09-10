@@ -1,0 +1,240 @@
+/* =========================================================================
+   Eaglercraft: Connected Client — styles (menu & screens)
+   ========================================================================= */
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+:root {
+  --bg: #0f0f14;
+  --panel: #1a1a24;
+  --panel2: #23232f;
+  --border: #33334a;
+  --text: #e8e8f0;
+  --muted: #8a8aa0;
+  --accent: #4a9eff;
+  --accent2: #7c5cff;
+  --danger: #ff5566;
+  --heart: #ff3355;
+}
+
+html, body { height: 100%; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Segoe UI', system-ui, sans-serif;
+  overflow: hidden;
+}
+
+/* ---------- Screens ---------- */
+
+.screen {
+  position: fixed; inset: 0;
+  display: none;
+  align-items: center; justify-content: center;
+}
+.screen.active { display: flex; }
+
+/* ---------- Menu ---------- */
+
+.menu-panel {
+  width: min(560px, 92vw);
+  max-height: 92vh;
+  overflow-y: auto;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 28px 32px;
+  box-shadow: 0 20px 60px rgba(0,0,0,.5);
+}
+
+.title {
+  font-size: 42px; font-weight: 800;
+  background: linear-gradient(90deg, var(--accent), var(--accent2));
+  -webkit-background-clip: text; background-clip: text;
+  color: transparent;
+  letter-spacing: -1px;
+}
+.subtitle { color: var(--muted); margin-bottom: 26px; font-size: 18px; }
+
+.menu-section { margin-bottom: 22px; }
+.menu-section label { display: block; margin-bottom: 6px; font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
+
+.section-header {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 8px; font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px;
+}
+
+input {
+  width: 100%;
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 10px 12px;
+  border-radius: 8px;
+  font-size: 15px;
+  outline: none;
+}
+input:focus { border-color: var(--accent); }
+
+/* Server list */
+.server-list { list-style: none; }
+.server-item {
+  display: flex; align-items: center; gap: 12px;
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin-bottom: 8px;
+}
+.server-item .server-icon {
+  width: 38px; height: 38px; border-radius: 8px;
+  background: linear-gradient(135deg, var(--accent), var(--accent2));
+  display: flex; align-items: center; justify-content: center;
+  font-weight: 800; font-size: 17px; color: #fff;
+  flex-shrink: 0;
+}
+.server-item .server-info { flex: 1; min-width: 0; }
+.server-item .server-name { font-weight: 600; font-size: 15px; }
+.server-item .server-addr { color: var(--muted); font-size: 12px; }
+
+.server-item .btn.connect { min-width: 96px; }
+
+/* Buttons */
+.btn {
+  background: var(--panel2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  padding: 10px 18px;
+  border-radius: 8px;
+  font-size: 15px;
+  cursor: pointer;
+  transition: all .15s;
+}
+.btn:hover { border-color: var(--accent); color: #fff; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+.btn.primary:hover { background: #3a8ae8; }
+.btn.danger { border-color: var(--danger); color: var(--danger); }
+.btn.danger:hover { background: rgba(255,85,102,.1); }
+.btn.small { padding: 6px 12px; font-size: 13px; }
+
+/* Server add form */
+.server-form {
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px;
+  margin-bottom: 10px;
+  display: grid; gap: 4px;
+}
+.server-form label { font-size: 12px; color: var(--muted); margin-top: 6px; }
+.form-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+
+.hidden { display: none !important; }
+.muted { color: var(--muted); font-size: 13px; }
+
+.menu-footer { text-align: center; margin-top: 18px; }
+
+/* ---------- Loading / queue ---------- */
+
+.loading-panel {
+  text-align: center;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 40px 60px;
+}
+.spinner {
+  width: 44px; height: 44px;
+  border: 4px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  margin: 0 auto 18px;
+  animation: spin 1s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+
+/* ---------- Game HUD ---------- */
+
+#game-canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+
+#crosshair {
+  position: absolute; left: 50%; top: 50%;
+  transform: translate(-50%, -50%);
+  font-size: 22px; color: rgba(255,255,255,.85);
+  text-shadow: 0 0 3px #000;
+  pointer-events: none;
+}
+
+#debug-info {
+  position: absolute; top: 8px; left: 8px;
+  font-family: 'Consolas', monospace; font-size: 12px;
+  color: #fff; text-shadow: 1px 1px 1px #000;
+  pointer-events: none;
+  white-space: pre;
+}
+
+#hearts-bar {
+  position: absolute; bottom: 76px; left: 50%;
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+#hearts { display: flex; gap: 2px; }
+.heart { width: 18px; height: 18px; position: relative; }
+.heart::before { content: '❤'; font-size: 18px; color: var(--heart); }
+.heart.empty::before { color: #3a1116; }
+
+/* Chat */
+#chat-area {
+  position: absolute; left: 8px; bottom: 8px;
+  width: min(560px, 60vw);
+  display: flex; flex-direction: column;
+}
+#chat-messages {
+  max-height: 180px; overflow-y: auto;
+  font-size: 13px; line-height: 1.5;
+  padding: 6px 8px;
+  background: rgba(0,0,0,.45);
+  border-radius: 6px;
+  display: flex; flex-direction: column;
+  gap: 2px;
+}
+#chat-messages:empty { display: none; }
+.chat-line { color: #fff; text-shadow: 1px 1px 1px #000; word-wrap: break-word; }
+.chat-line .from { color: var(--accent); font-weight: 600; }
+.chat-line.system { color: var(--muted); font-style: italic; }
+#chat-input-row { margin-top: 4px; }
+#chat-input { background: rgba(0,0,0,.6); }
+
+/* Hotbar (visual placeholder) */
+#hotbar {
+  position: absolute; bottom: 8px; left: 50%;
+  transform: translateX(-50%);
+  display: flex; gap: 4px;
+  pointer-events: none;
+}
+.hotbar-slot {
+  width: 44px; height: 44px;
+  background: rgba(0,0,0,.5);
+  border: 2px solid #555;
+  border-radius: 4px;
+}
+
+/* ---------- Error screen ---------- */
+
+.error-panel {
+  width: min(480px, 92vw);
+  background: var(--panel);
+  border: 1px solid var(--danger);
+  border-radius: 14px;
+  padding: 32px;
+  text-align: center;
+}
+.error-panel h2 { color: var(--danger); margin-bottom: 12px; }
+.error-panel p { color: var(--muted); margin-bottom: 22px; word-break: break-word; }
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 10px; }
+::-webkit-scrollbar-track { background: var(--panel); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 5px; }
