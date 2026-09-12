@@ -92,7 +92,16 @@ class Renderer {
     this.ready = false
     this.frames = 0
     this.lastFpsTime = performance.now()
+    this.lastFrameTime = performance.now() // per-frame dt (smoothing)
     this.fps = 0
+    // Camera prediction state (see updateCamera/applyCameraEachFrame)
+    this.camTarget = null   // last server position {x,y,z}
+    this.camPos = null      // smoothed current camera position
+    this.camSnapped = false // true after the first server position snaps
+    this.localYaw = null    // local (mouse) look — null until first mouse move
+    this.localPitch = null
+    this.serverYaw = undefined   // last server look echo (used when not locked)
+    this.serverPitch = undefined
   }
 
   async init (loginMsg) {
@@ -107,6 +116,9 @@ class Renderer {
     this.scene.fog = new THREE.Fog(0x87ceeb, this.renderDistance * 16 * 0.7, this.renderDistance * 16)
 
     this.camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 1000)
+    // Mineflayer yaw/pitch conventions map exactly to three.js with the
+    // YXZ rotation order: ry = yaw, rx = -pitch (see applyCameraEachFrame).
+    this.camera.rotation.order = 'YXZ'
 
     // Perf: antialias is the single most expensive WebGL option for a voxel
     // renderer (MSAA on thousands of quads); the pixel-blob textures hide
@@ -417,20 +429,22 @@ class Renderer {
   }
 
   /** Per-frame interpolation of entity positions (movement updates only
-   *  arrive ~10 times per second now — without smoothing mobs teleport). */
-  interpolateEntities () {
+   *  arrive ~10 times per second now — without smoothing mobs teleport).
+   *  Time-based smoothing: identical feel at any fps. */
+  interpolateEntities (dtMs) {
+    const alpha = 1 - Math.exp(-dtMs / 80) // τ = 80 ms for mobs
     for (const group of this.entities.values()) {
       const t = group.userData.target
       if (!t) continue
-      group.position.x += (t.x - group.position.x) * 0.25
-      group.position.y += (t.y - group.position.y) * 0.25
-      group.position.z += (t.z - group.position.z) * 0.25
+      group.position.x += (t.x - group.position.x) * alpha
+      group.position.y += (t.y - group.position.y) * alpha
+      group.position.z += (t.z - group.position.z) * alpha
       const ty = group.userData.targetYaw
       if (ty !== undefined) {
         let d = ty - group.rotation.y
         while (d > Math.PI) d -= 2 * Math.PI
         while (d < -Math.PI) d += 2 * Math.PI
-        group.rotation.y += d * 0.25
+        group.rotation.y += d * alpha
       }
     }
   }
@@ -507,22 +521,67 @@ class Renderer {
 
   updateCamera (x, y, z, yaw, pitch) {
     if (!this.camera) return
-    // Mineflayer conventions (see prismarine-physics getLookingVector):
-    //   forward = (-sin(yaw)·cos(pitch), sin(pitch), -cos(yaw)·cos(pitch))
-    //   yaw 0 = north (-Z), positive yaw = turning left (CCW); pitch + = down.
-    // Three.js camera with rotation order YXZ:
-    //   forward = (-sin(ry)·cos(rx), sin(rx), -cos(ry)·cos(rx))
-    // The two match exactly with ry = yaw, rx = -pitch.
-    this.camera.rotation.order = 'YXZ'
-    this.camera.rotation.y = yaw
-    this.camera.rotation.x = -pitch
-    this.camera.position.set(x, y + 1.62, z) // eye height 1.62
+    // Server position update (20 Hz): store as the smoothing TARGET only.
+    // The actual camera transform is applied every frame in animate() using
+    // the local (predicted) look — applying it here made the camera update
+    // at 20 Hz and the game FEEL like 20 fps even at 300 fps.
+    this.camTarget = { x, y, z }
+    this.serverYaw = yaw
+    this.serverPitch = pitch
+    // Instantly snap the first update (spawn/teleport) so the camera
+    // doesn't glide across the world on login.
+    if (!this.camSnapped) {
+      this.camSnapped = true
+      this.camPos = { x, y, z }
+      this.camera.position.set(x, y + 1.62, z)
+    }
+  }
+
+  /** Local look from the mouse (prediction, zero latency). */
+  setLocalLook (yaw, pitch) {
+    this.localYaw = yaw
+    this.localPitch = pitch
+  }
+
+  /**
+   * Applies the camera transform EVERY FRAME:
+   *  - rotation from the LOCAL mouse look (instant, no network round-trip)
+   *  - position smoothed toward the last server position with a time
+   *    constant of 50 ms (matches the server's 20 Hz update rate, so the
+   *    movement looks fluid at any fps without adding latency)
+   *  - when the pointer is NOT locked, the server's yaw/pitch echo is used
+   *    (spectating/knockback corrections)
+   * The smoothing factor is TIME-based (dt in ms) so the feel is identical
+   * at 30, 60 or 300 fps.
+   */
+  applyCameraEachFrame (serverYaw, serverPitch, dtMs) {
+    const cam = this.camera
+    if (!cam) return
+    // Rotation: local look takes priority while the mouse drives the camera
+    if (this.localYaw !== null && document.pointerLockElement) {
+      cam.rotation.y = this.localYaw
+      cam.rotation.x = -this.localPitch
+    } else if (serverYaw !== undefined) {
+      cam.rotation.y = serverYaw
+      cam.rotation.x = -serverPitch
+    }
+    // Position: exponential smoothing toward the server target.
+    // alpha = 1 - exp(-dt/τ) with τ = 50 ms — framerate-independent.
+    if (this.camPos && this.camTarget) {
+      const alpha = 1 - Math.exp(-dtMs / 50)
+      this.camPos.x += (this.camTarget.x - this.camPos.x) * alpha
+      this.camPos.y += (this.camTarget.y - this.camPos.y) * alpha
+      this.camPos.z += (this.camTarget.z - this.camPos.z) * alpha
+      cam.position.set(this.camPos.x, this.camPos.y + 1.62, this.camPos.z)
+    }
   }
 
   animate () {
     if (!this.ready) return
     this.frames++
     const now = performance.now()
+    const dtMs = now - this.lastFrameTime
+    this.lastFrameTime = now
     if (now - this.lastFpsTime >= 1000) {
       this.fps = this.frames
       this.frames = 0
@@ -539,7 +598,10 @@ class Renderer {
         if (performance.now() >= budgetEnd) break
       }
     }
-    if (this.entities.size > 0) this.interpolateEntities()
+    if (this.entities.size > 0) this.interpolateEntities(dtMs)
+    // Camera: applied EVERY frame with the local (predicted) look and a
+    // smoothed position — never at the 20 Hz network rate.
+    this.applyCameraEachFrame(this.serverYaw, this.serverPitch, dtMs)
     this.renderer.render(this.scene, this.camera)
   }
 

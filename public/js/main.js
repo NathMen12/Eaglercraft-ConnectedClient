@@ -120,6 +120,21 @@
       const idToName = await buildIdToName(msg.version)
       renderer.setBlockNames(idToName)
       await renderer.init(msg)
+      // Camera prediction wiring: every mouse move rotates the camera
+      // locally & instantly (zero latency); the server echo is only a
+      // fallback when the pointer is NOT locked.
+      Game.onLookChange((yaw, pitch) => renderer.setLocalLook(yaw, pitch))
+      const look = Game.getLook()
+      renderer.setLocalLook(look.yaw, look.pitch)
+      // Re-sync the predicted look when the pointer lock is (re)acquired:
+      // while unlocked the look follows the server echo, so the prediction
+      // must not stay stale from an earlier session.
+      document.addEventListener('pointerlockchange', () => {
+        if (document.pointerLockElement) {
+          const l = Game.getLook()
+          renderer.setLocalLook(l.yaw, l.pitch)
+        }
+      })
     })
 
     /** Resolves as soon as the renderer module has set window.Renderer. */

@@ -24,10 +24,21 @@ const Game = (() => {
   // messages/s forever for nothing.
   let lastSent = 0
   const SEND_INTERVAL = 100
+  // Look updates are latency-sensitive (they aim the bot): sent at 20 Hz,
+  // on a SEPARATE timer so they are never delayed behind controls.
+  let lastLookSent = 0
+  const LOOK_SEND_INTERVAL = 50
   let lastSentControls = null
   let lastSentYaw = 0
   let lastSentPitch = 0
   const LOOK_EPSILON = 0.01 // ~0.57° — below human perception
+
+  // Called on EVERY mouse move with the new local look. The renderer uses
+  // it to rotate the camera INSTANTLY (client-side prediction) instead of
+  // waiting for the 20 Hz server echo — this is what removes the
+  // "capped at 20 fps" feel while the render loop runs at full speed.
+  let lookCallback = null
+  function onLookChange (fn) { lookCallback = fn }
 
   function isActive () { return state.active }
 
@@ -119,6 +130,9 @@ const Game = (() => {
     // Normalize yaw to [-π, π]
     if (state.yaw > Math.PI) state.yaw -= 2 * Math.PI
     if (state.yaw < -Math.PI) state.yaw += 2 * Math.PI
+    // Camera prediction: notify the renderer IMMEDIATELY (same event, zero
+    // latency) — do not wait for the 20 Hz network echo.
+    if (lookCallback) lookCallback(state.yaw, state.pitch)
   }
 
   function onCanvasClick () {
@@ -175,6 +189,16 @@ const Game = (() => {
   function tick () {
     if (!state.active) return
     const now = performance.now()
+    // Look: 20 Hz, independent from controls (aiming is latency-sensitive)
+    if (typeof Net !== 'undefined' && Net.isOpen() &&
+        now - lastLookSent >= LOOK_SEND_INTERVAL &&
+        (Math.abs(state.yaw - lastSentYaw) > LOOK_EPSILON ||
+         Math.abs(state.pitch - lastSentPitch) > LOOK_EPSILON)) {
+      lastLookSent = now
+      lastSentYaw = state.yaw
+      lastSentPitch = state.pitch
+      Net.send({ t: 'look', yaw: state.yaw, pitch: state.pitch })
+    }
     if (now - lastSent >= SEND_INTERVAL) {
       lastSent = now
       if (typeof Net !== 'undefined' && Net.isOpen()) {
@@ -188,13 +212,6 @@ const Game = (() => {
         if (changed) {
           lastSentControls = { ...c }
           Net.send({ t: 'control', states: { ...c } })
-        }
-        // Look: send only when the camera moved since the last send
-        if (Math.abs(state.yaw - lastSentYaw) > LOOK_EPSILON ||
-            Math.abs(state.pitch - lastSentPitch) > LOOK_EPSILON) {
-          lastSentYaw = state.yaw
-          lastSentPitch = state.pitch
-          Net.send({ t: 'look', yaw: state.yaw, pitch: state.pitch })
         }
       }
     }
@@ -267,6 +284,9 @@ const Game = (() => {
     state.pitch = pitch
   }
 
+  /** Current local look (used by the renderer for camera prediction). */
+  function getLook () { return { yaw: state.yaw, pitch: state.pitch } }
+
   // ------------------------------------------------------------------
   // Binding
   // ------------------------------------------------------------------
@@ -295,7 +315,7 @@ const Game = (() => {
 
   return {
     start, stop, isActive, state,
-    updateHud, addChatLine, updateDebug, setPosition, setLook
+    updateHud, addChatLine, updateDebug, setPosition, setLook, getLook, onLookChange
   }
 })()
 
