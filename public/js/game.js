@@ -19,7 +19,14 @@ const Game = (() => {
     chatOpen: false,
     // V1.1.0 — hotbar / inventory state (kept in sync by main.js)
     hotbar: new Array(9).fill(null), // [{ name, count }] | null
-    selectedSlot: 0
+    selectedSlot: 0,
+    // V1.1.1 — full inventory (36 slots: 0-8 hotbar, 9-35 main grid).
+    // Server slot indexes 36-44 map to 0-8 here (quick bar first, like the
+    // vanilla inventory screen layout).
+    inventory: new Array(36).fill(null),
+    inventoryOpen: false,
+    // First clicked slot while the inventory screen is open (swap source)
+    pickedSlot: null
   }
 
   // Hotbar DOM signature — avoids rebuilding identical slots (see renderHotbar).
@@ -94,6 +101,9 @@ const Game = (() => {
     // (same tab, back from the menu) must not keep the previous hotbar.
     state.hotbar = new Array(9).fill(null)
     state.selectedSlot = 0
+    state.inventory = new Array(36).fill(null)
+    state.pickedSlot = null
+    if (state.inventoryOpen) closeInventory()
     lastHotbarSignature = '' // force a hotbar re-render
     renderHotbar()
     requestAnimationFrame(tick)
@@ -141,6 +151,19 @@ const Game = (() => {
       if (typeof Net !== 'undefined' && Net.isOpen()) Net.send({ t: 'reset_chunks' })
       if (reloadChunksCallback) reloadChunksCallback()
       addChatLine(null, 'Rechargement des chunks…')
+      return
+    }
+    if (e.code === 'KeyE') {
+      // V1.1.1 — inventory screen toggle (vanilla binding)
+      e.preventDefault()
+      if (state.inventoryOpen) closeInventory()
+      else openInventory()
+      return
+    }
+    // While the inventory screen is open every other game key is captured
+    // except Escape (close) — vanilla behaves the same.
+    if (state.inventoryOpen) {
+      if (e.code === 'Escape') closeInventory()
       return
     }
     // Hotbar slots 1-9 (vanilla binding)
@@ -422,7 +445,10 @@ const Game = (() => {
     if (typeof msg.selected === 'number' && msg.selected >= 0 && msg.selected <= 8) {
       state.selectedSlot = msg.selected
     }
+    // The hotbar snapshot IS the inventory's quick-bar row (client 0-8)
+    for (let i = 0; i < 9; i++) state.inventory[i] = state.hotbar[i]
     renderHotbar()
+    if (state.inventoryOpen) renderInventory()
   }
 
   /** Single quick-bar item change (server 'inv_slot' with index 36-44, or a
@@ -430,7 +456,150 @@ const Game = (() => {
   function updateHotbarSlot (index, item) {
     if (index < 0 || index > 8) return
     state.hotbar[index] = item ? { name: item.name, count: item.count } : null
+    state.inventory[index] = state.hotbar[index]
     renderHotbar()
+    if (state.inventoryOpen) renderInventory()
+  }
+
+  // ------------------------------------------------------------------
+  // Inventory screen (V1.1.1 — E key)
+  // ------------------------------------------------------------------
+
+  /** Server slot index -> client inventory index (hotbar 36-44 -> 0-8). */
+  function serverSlotToClient (index) {
+    if (index >= 36 && index <= 44) return index - 36
+    return index // 0-35 unchanged
+  }
+
+  function openInventory () {
+    state.inventoryOpen = true
+    state.pickedSlot = null
+    document.getElementById('inventory-screen').classList.remove('hidden')
+    if (document.pointerLockElement) document.exitPointerLock()
+    renderInventory()
+  }
+
+  function closeInventory () {
+    state.inventoryOpen = false
+    state.pickedSlot = null
+    document.getElementById('inventory-screen').classList.add('hidden')
+  }
+
+  /** Builds the DOM slots once, then only refreshes icons/counts. */
+  let invDomBuilt = false
+  function ensureInvDom () {
+    if (invDomBuilt) return
+    invDomBuilt = true
+    const grid = document.getElementById('inventory-grid')
+    const hot = document.getElementById('inventory-hotbar')
+    for (let i = 9; i < 36; i++) grid.appendChild(buildInvSlotEl(i))
+    for (let i = 0; i < 9; i++) hot.appendChild(buildInvSlotEl(i))
+  }
+
+  function buildInvSlotEl (clientIndex) {
+    const el = document.createElement('div')
+    el.className = 'inv-slot'
+    el.dataset.slot = String(clientIndex)
+    el.addEventListener('click', onInventorySlotClick)
+    return el
+  }
+
+  function renderInventory () {
+    ensureInvDom()
+    const slots = document.querySelectorAll('#inventory-screen .inv-slot')
+    for (const el of slots) {
+      const i = parseInt(el.dataset.slot, 10)
+      const item = state.inventory[i]
+      // Selected (source of an in-progress swap) is outlined
+      const picked = state.pickedSlot === i
+      el.classList.toggle('picked', picked)
+      el.classList.toggle('in-hotbar', i < 9)
+      fillItemEl(el, item)
+    }
+  }
+
+  /** Writes icon + count into a slot element (shared by hotbar & inventory). */
+  function fillItemEl (el, item) {
+    // Keep the click listener on the parent: rebuild children only
+    const icon = el.querySelector('.hotbar-icon, .inv-icon')
+    if (icon) icon.remove()
+    const count = el.querySelector('.hotbar-count')
+    if (count) count.remove()
+    if (!item) return
+    const img = document.createElement('div')
+    img.className = 'inv-icon'
+    const iconInfo = getItemIcon(item.name)
+    if (iconInfo) {
+      img.style.backgroundImage = `url(${iconInfo.url})`
+      const tx = (iconInfo.tile % 64) * 32
+      const ty = Math.floor(iconInfo.tile / 64) * 32
+      img.style.backgroundPosition = `-${tx}px -${ty}px`
+      img.style.backgroundSize = '2048px 2048px'
+    } else {
+      img.classList.add('hotbar-icon-fallback')
+    }
+    el.appendChild(img)
+    if (item.count > 1) {
+      const c = document.createElement('span')
+      c.className = 'hotbar-count'
+      c.textContent = item.count > 99 ? '99+' : String(item.count)
+      el.appendChild(c)
+    }
+  }
+
+  /**
+   * Two clicks = one swap: pick the source slot, then the destination. The
+   * server does the real clickWindow pair (see handleInvSwap) and the result
+   * comes back through inv_slot pushes — the client never invents state.
+   */
+  function onInventorySlotClick (e) {
+    const el = e.currentTarget
+    const to = parseInt(el.dataset.slot, 10)
+    if (state.pickedSlot === null) {
+      if (!state.inventory[to]) return // can't pick up an empty slot
+      state.pickedSlot = to
+    } else {
+      const from = state.pickedSlot
+      state.pickedSlot = null
+      if (from !== to) {
+        // Server slot index: client 0-8 (hotbar) -> 36-44
+        const fromServer = from < 9 ? from + 36 : from
+        const toServer = to < 9 ? to + 36 : to
+        if (typeof Net !== 'undefined' && Net.isOpen()) {
+          Net.send({ t: 'inv_swap', from: fromServer, to: toServer })
+        }
+        // Optimistic display swap (inv_slot echoes will correct any drift)
+        const tmp = state.inventory[from]
+        state.inventory[from] = state.inventory[to]
+        state.inventory[to] = tmp
+      }
+    }
+    renderInventory()
+    syncHotbarFromInventory()
+  }
+
+  /** Mirrors inventory hotbar slots (0-8) into the HUD hotbar state. */
+  function syncHotbarFromInventory () {
+    let changed = false
+    for (let i = 0; i < 9; i++) {
+      if (state.hotbar[i] !== state.inventory[i]) {
+        state.hotbar[i] = state.inventory[i]
+        changed = true
+      }
+    }
+    if (changed) renderHotbar()
+  }
+
+  /** Server 'inv_slot' push (index 0-44) — main.js routes 36-44 here too. */
+  function updateInventorySlot (serverIndex, item) {
+    const i = serverSlotToClient(serverIndex)
+    if (i < 0 || i > 35) return
+    state.inventory[i] = item ? { name: item.name, count: item.count } : null
+    if (i < 9) {
+      state.hotbar[i] = state.inventory[i]
+      renderHotbar()
+    }
+    if (state.inventoryOpen) renderInventory()
   }
 
   function renderHealthHud () {
@@ -562,7 +731,9 @@ const Game = (() => {
     // V1.1.0 — chunk reload, mouse attacks, hotbar
     onReloadChunks, onAttack,
     updateHotbar, updateHotbarSlot, selectHotbarSlot, renderHotbar,
-    setItemIconProvider
+    setItemIconProvider,
+    // V1.1.1 — inventory screen (E)
+    updateInventorySlot
   }
 })()
 

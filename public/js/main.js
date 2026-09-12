@@ -135,6 +135,7 @@
       // bot to dig it / place against it (the server does its own reach check)
       Game.onAttack((kind) => {
         const target = renderer.highlight
+        if (renderer.swingHand) renderer.swingHand() // V1.1.1 — punch animation
         if (kind === 'dig') {
           if (!target) return
           Net.send({ t: 'dig', x: target.x, y: target.y, z: target.z })
@@ -151,6 +152,18 @@
           Net.send({ t: 'activate' })
         }
       })
+      // V1.1.1 — the hand shows the held item; re-synced on every hotbar /
+      // selection change through a light poll (0.5 s, only while in game):
+      // the held item depends on BOTH the selected slot and the hotbar
+      // contents, both of which change via several code paths.
+      const syncHeldItem = () => {
+        if (renderer.setHeldItem) {
+          const held = Game.state.hotbar[Game.state.selectedSlot]
+          renderer.setHeldItem(held ? held.name : null)
+        }
+      }
+      syncHeldItem()
+      setInterval(() => { if (Game.isActive()) syncHeldItem() }, 500)
       // V1.1.0 — item icons (atlas built by the server from the pack)
       loadItemIcons()
       // Re-sync the predicted look when the pointer lock is (re)acquired:
@@ -240,12 +253,8 @@
     // V1.1.0 — inventory / hotbar sync
     Net.on('hotbar', (msg) => Game.updateHotbar(msg))
     Net.on('inv_slot', (msg) => {
-      // Server slot indexes: 0-35 main inventory, 36-44 quick bar. Only the
-      // quick-bar range is displayed (hotbar); the rest is kept for the
-      // future full-inventory screen.
-      if (typeof msg.index === 'number' && msg.index >= 36 && msg.index <= 44) {
-        Game.updateHotbarSlot(msg.index - 36, msg.item)
-      }
+      if (typeof msg.index !== 'number' || msg.index < 0 || msg.index > 44) return
+      Game.updateInventorySlot(msg.index, msg.item)
     })
     Net.on('slot_selected', (msg) => {
       if (typeof msg.slot === 'number') Game.selectHotbarSlot(msg.slot, false)
@@ -255,8 +264,19 @@
       // full re-stream rebuilds the world cleanly (phantom-block fix).
       if (renderer && renderer.ready) renderer.clearAllChunks()
     })
-    Net.on('dig_error', (msg) => Game.addChatLine(null, `⛏ ${msg.error || 'Minage impossible'}`))
+    // V1.1.1 — dig feedback: swing the hand, show the crack overlay
+    Net.on('dig_start', (msg) => {
+      if (renderer && renderer.ready) renderer.handleDigStart(msg.x, msg.y, msg.z, msg.time)
+    })
+    Net.on('dig_ok', () => {
+      if (renderer && renderer.ready) renderer.handleDigEnd()
+    })
+    Net.on('dig_error', (msg) => {
+      if (renderer && renderer.ready) renderer.handleDigEnd()
+      Game.addChatLine(null, `⛏ ${msg.error || 'Minage impossible'}`)
+    })
     Net.on('place_error', (msg) => Game.addChatLine(null, `⚠ ${msg.error || 'Pose impossible'}`))
+    Net.on('inv_swap_error', (msg) => Game.addChatLine(null, `⚠ ${msg.error || 'Échange impossible'}`))
 
     // Binary chunks
     Net.onBinaryChunk((decoded) => {

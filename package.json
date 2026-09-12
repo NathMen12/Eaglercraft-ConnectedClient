@@ -1,6 +1,6 @@
 {
   "name": "eaglercraft-connected-client",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Eaglercraft: Connected Client — a playable Minecraft client in the browser. A Node.js server spawns a Mineflayer bot on the target server and streams blocks, entities and events to a Three.js renderer.",
   "main": "server/index.js",
   "scripts": {

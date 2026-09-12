@@ -71,6 +71,9 @@ const FACE_DEFS = [
   }
 ]
 
+// Untinted vertex color (white — the texture shows through untouched)
+const WHITE_TINT = [1, 1, 1]
+
 class Renderer {
   constructor () {
     this.scene = null
@@ -108,6 +111,16 @@ class Renderer {
     // V1.1.0 — block targeting: last raycast hit + its wireframe box
     this.highlight = null      // { x, y, z, face, name } | null
     this.highlightMesh = null  // THREE.LineSegments (black wireframe)
+    // V1.1.1 — first-person hand, swing animation, mining crack overlay
+    this.handScene = null
+    this.handCamera = null
+    this.handRoot = null
+    this.handMesh = null
+    this.heldName = undefined // undefined = never built; null = bare arm
+    this.swingT = 1           // 1 = idle (swing runs 0 -> 1)
+    this.destroyTexture = null
+    this.destroyMesh = null
+    this.digState = null      // { x, y, z, start, duration }
   }
 
   async init (loginMsg) {
@@ -153,6 +166,9 @@ class Renderer {
     this.atlasPixelSize = this.atlasGrid * this.tileSize
 
     window.addEventListener('resize', () => this.onResize())
+    // V1.1.1 — first-person hand + mining crack overlay
+    this.initHandScene()
+    this.loadOverlays() // async; the overlay just stays absent on 404
     this.ready = true
     this.startLoop()
   }
@@ -177,6 +193,11 @@ class Renderer {
     this.camera.aspect = window.innerWidth / window.innerHeight
     this.camera.updateProjectionMatrix()
     this.renderer.setSize(window.innerWidth, window.innerHeight)
+    // The hand scene must keep the same aspect or the arm stretches on resize
+    if (this.handCamera) {
+      this.handCamera.aspect = window.innerWidth / window.innerHeight
+      this.handCamera.updateProjectionMatrix()
+    }
   }
 
   // ------------------------------------------------------------------
@@ -256,15 +277,27 @@ class Renderer {
     }
   }
 
+  /** Decodes an RGB565 tint into 0-1 floats (undefined when untinted). */
+  static decodeTint (tint) {
+    if (!tint) return null
+    const r = (tint >> 11) & 0x1f
+    const g = (tint >> 5) & 0x3f
+    const b = tint & 0x1f
+    return [(r << 3) / 255, (g << 2) / 255, (b << 3) / 255]
+  }
+
   /**
    * Builds a single BufferGeometry mesh for a chunk from visible blocks.
    * faceMask bits: 1=+X, 2=-X, 4=+Y, 8=-Y, 16=+Z, 32=-Z
+   * Each entry may carry a biome tint (RGB565, 0 = none): it becomes the
+   * per-vertex color, multiplied with the map by the Lambert shader.
    */
   buildChunkMesh (decoded) {
     const { chunkX, chunkZ, minY, entries } = decoded
     const positions = []
     const normals = []
     const uvs = []
+    const colors = []
     const indices = []
 
     for (const e of entries) {
@@ -273,9 +306,11 @@ class Renderer {
       const wx = chunkX * 16 + e.x
       const wy = minY + e.y
       const wz = chunkZ * 16 + e.z
+      // Biome tint (grass/leaves/water) — default white = untinted
+      const tint = Renderer.decodeTint(e.tint) || WHITE_TINT
 
       if (info.cross) {
-        this.pushCross(positions, normals, uvs, indices, wx, wy, wz, info)
+        this.pushCross(positions, normals, uvs, indices, wx, wy, wz, info, colors, tint)
         continue
       }
 
@@ -293,6 +328,7 @@ class Renderer {
             c.uv[0] === 0 ? rect.u0 : rect.u1,
             c.uv[1] === 0 ? rect.v0 : rect.v1
           )
+          colors.push(tint[0], tint[1], tint[2])
         }
         indices.push(base, base + 1, base + 2, base, base + 2, base + 3)
       }
@@ -304,6 +340,7 @@ class Renderer {
     geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
     geometry.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3))
     geometry.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2))
+    geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3))
     geometry.setIndex(indices)
 
     const material = this.chunkMaterial()
@@ -313,10 +350,11 @@ class Renderer {
   }
 
   /** X-shaped plant geometry (grass, flowers...). */
-  pushCross (positions, normals, uvs, indices, wx, wy, wz, info) {
+  pushCross (positions, normals, uvs, indices, wx, wy, wz, info, colors, tint) {
     const tile = info.side !== undefined ? info.side : info.all
     if (tile === undefined) return
     const rect = this.uvRectCached(tile)
+    const tintArr = tint || WHITE_TINT
     // Two quads crossing diagonally; each rendered double-sided
     const quads = [
       { p: [[0, 0, 0], [1, 0, 1], [1, 1, 1], [0, 1, 0]], n: [1, 0, -1] },
@@ -331,6 +369,7 @@ class Renderer {
         normals.push(q.n[0], q.n[1], q.n[2])
         const uv = uvCorners[i]
         uvs.push(uv[0] === 0 ? rect.u0 : rect.u1, uv[1] === 0 ? rect.v0 : rect.v1)
+        colors.push(tintArr[0], tintArr[1], tintArr[2])
       }
       indices.push(base, base + 1, base + 2, base, base + 2, base + 3)
       // Double-sided: add the reversed quad
@@ -341,6 +380,7 @@ class Renderer {
         normals.push(q.n[0], q.n[1], q.n[2])
         const uv = uvCorners[i]
         uvs.push(uv[0] === 0 ? rect.u0 : rect.u1, uv[1] === 0 ? rect.v0 : rect.v1)
+        colors.push(tintArr[0], tintArr[1], tintArr[2])
       }
       indices.push(base2, base2 + 1, base2 + 2, base2, base2 + 2, base2 + 3)
     }
@@ -454,11 +494,252 @@ class Renderer {
     }
   }
 
+  // ------------------------------------------------------------------
+  // First-person hand / held item (V1.1.1)
+  // ------------------------------------------------------------------
+
+  /**
+   * The hand lives in its OWN scene rendered with a STATIC camera after the
+   * world pass (depth buffer cleared): it can never clip into world blocks
+   * and never moves with the world camera — exactly like vanilla's hand.
+   */
+  initHandScene () {
+    this.handScene = new THREE.Scene()
+    this.handCamera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.01, 10)
+    this.handScene.add(new THREE.AmbientLight(0xffffff, 1.0))
+    const sun = new THREE.DirectionalLight(0xffffff, 0.6)
+    sun.position.set(0.5, 1, 0.3)
+    this.handScene.add(sun)
+    this.handRoot = new THREE.Group()
+    this.handScene.add(this.handRoot)
+    this.swingT = 1 // 1 = idle (swing runs 0 -> 1)
+    this.rebuildHand()
+  }
+
+  /** Loads the destroy-stage crack sheet (may 404 — no overlay then). */
+  async loadOverlays () {
+    try {
+      this.destroyTexture = await this.loadTexture('/destroy.png')
+      if (this.destroyTexture) this.destroyTexture.repeat.set(0.1, 1)
+    } catch (e) {
+      this.destroyTexture = null
+    }
+  }
+
+  /** Item icon atlas (for held items) — loaded once, cached, null on failure. */
+  async ensureItemAtlas () {
+    if (this.itemAtlasInfo !== undefined) return this.itemAtlasInfo
+    try {
+      const res = await fetch('/items.json')
+      if (!res.ok) throw new Error('no item atlas')
+      const meta = await res.json()
+      const tex = await this.loadTexture('/items.png')
+      this.itemAtlasInfo = { tex, items: meta.items || {}, grid: meta.atlasGrid || 64 }
+    } catch (e) {
+      this.itemAtlasInfo = null
+    }
+    return this.itemAtlasInfo
+  }
+
+  /** Rebuilds the hand mesh when the held item changes (null = bare arm). */
+  setHeldItem (name) {
+    if (name === this.heldName) return
+    this.heldName = name
+    this.rebuildHand()
+  }
+
+  async rebuildHand () {
+    const name = this.heldName
+    // Drop the current mesh (dispose GPU resources — repeated swaps leak)
+    if (this.handMesh) {
+      this.handRoot.remove(this.handMesh)
+      this.handMesh.geometry.dispose()
+      const mats = Array.isArray(this.handMesh.material) ? this.handMesh.material : [this.handMesh.material]
+      for (const m of mats) m.dispose()
+      this.handMesh = null
+    }
+    if (!this.handScene) return
+    if (!name) {
+      this.handMesh = this.buildArmMesh()
+    } else if (this.blockMappings && this.blockMappings[name]) {
+      this.handMesh = this.buildBlockHandMesh(name)
+    } else {
+      // Not a block: icon quad from the item atlas (async — one fetch ever)
+      const atlas = await this.ensureItemAtlas()
+      if (name !== this.heldName) return // selection changed while loading
+      if (atlas && atlas.items[name] !== undefined) {
+        this.handMesh = this.buildItemHandMesh(name, atlas)
+      } else {
+        this.handMesh = this.buildArmMesh() // unknown item -> arm fallback
+      }
+    }
+    if (this.handMesh) this.handRoot.add(this.handMesh)
+  }
+
+  /** Bare Steve-style arm (nothing held). */
+  buildArmMesh () {
+    const geo = new THREE.BoxGeometry(0.24, 0.24, 0.7)
+    const mat = new THREE.MeshLambertMaterial({ color: 0xc98d6d })
+    const mesh = new THREE.Mesh(geo, mat)
+    mesh.position.set(0.55, -0.6, -0.72)
+    mesh.rotation.set(0.5, -0.15, 0)
+    return mesh
+  }
+
+  /** Held BLOCK: a cube textured with the block's atlas tiles (iso view). */
+  buildBlockHandMesh (name) {
+    const info = this.blockMappings[name]
+    if (info.cross) return this.buildCrossHandMesh(info)
+    const positions = []
+    const normals = []
+    const uvs = []
+    const indices = []
+    for (const f of FACE_DEFS) {
+      const tile = info[f.tile] !== undefined ? info[f.tile] : info.side
+      const rect = this.uvRectCached(tile)
+      const base = positions.length / 3
+      for (let ci = 0; ci < 4; ci++) {
+        const c = f.corners[ci]
+        positions.push(c.p[0] - 0.5, c.p[1] - 0.5, c.p[2] - 0.5)
+        normals.push(f.dir[0], f.dir[1], f.dir[2])
+        uvs.push(c.uv[0] === 0 ? rect.u0 : rect.u1, c.uv[1] === 0 ? rect.v0 : rect.v1)
+      }
+      indices.push(base, base + 1, base + 2, base, base + 2, base + 3)
+    }
+    const geometry = new THREE.BufferGeometry()
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
+    geometry.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3))
+    geometry.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2))
+    geometry.setIndex(indices)
+    const material = new THREE.MeshLambertMaterial({ map: this.atlasTexture })
+    const mesh = new THREE.Mesh(geometry, material)
+    mesh.scale.setScalar(0.4)
+    mesh.position.set(0.52, -0.42, -0.75)
+    mesh.rotation.y = -Math.PI / 4 // vanilla's isometric block angle
+    return mesh
+  }
+
+  /** Held CROSS block (torch, flowers...): flat quad with the side tile. */
+  buildCrossHandMesh (info) {
+    const tile = info.side !== undefined ? info.side : info.all
+    if (tile === undefined) return this.buildArmMesh()
+    const rect = this.uvRectCached(tile)
+    const geometry = new THREE.PlaneGeometry(0.55, 0.55)
+    const uv = geometry.attributes.uv
+    uv.setXY(0, rect.u0, rect.v1)
+    uv.setXY(1, rect.u1, rect.v1)
+    uv.setXY(2, rect.u0, rect.v0)
+    uv.setXY(3, rect.u1, rect.v0)
+    const material = new THREE.MeshLambertMaterial({
+      map: this.atlasTexture, transparent: true, alphaTest: 0.1, side: THREE.DoubleSide
+    })
+    const mesh = new THREE.Mesh(geometry, material)
+    mesh.position.set(0.6, -0.48, -0.78)
+    mesh.rotation.set(0, -0.4, 0.3)
+    return mesh
+  }
+
+  /** Held ITEM (tool/food/...): flat quad with its icon from the item atlas. */
+  buildItemHandMesh (name, atlas) {
+    const rect = this.uvRectOnAtlas(atlas.items[name], atlas.grid)
+    const geometry = new THREE.PlaneGeometry(0.55, 0.55)
+    const uv = geometry.attributes.uv
+    uv.setXY(0, rect.u0, rect.v1)
+    uv.setXY(1, rect.u1, rect.v1)
+    uv.setXY(2, rect.u0, rect.v0)
+    uv.setXY(3, rect.u1, rect.v0)
+    const material = new THREE.MeshLambertMaterial({
+      map: atlas.tex, transparent: true, alphaTest: 0.1, side: THREE.DoubleSide
+    })
+    const mesh = new THREE.Mesh(geometry, material)
+    mesh.position.set(0.62, -0.5, -0.8)
+    mesh.rotation.set(0, -0.45, 0.35)
+    return mesh
+  }
+
+  /** UV rect of a tile on ANY square grid atlas (items use 64 like blocks). */
+  uvRectOnAtlas (tileIndex, grid) {
+    const S = grid * 16
+    const tx = (tileIndex % grid) * 16
+    const ty = Math.floor(tileIndex / grid) * 16
+    const inset = 0.02
+    return {
+      u0: (tx + inset) / S,
+      u1: (tx + 16 - inset) / S,
+      v1: 1 - (ty + inset) / S,
+      v0: 1 - (ty + 16 - inset) / S
+    }
+  }
+
+  /** Punch animation trigger (dig / place / activate). */
+  swingHand () {
+    if (this.handRoot) this.swingT = 0
+  }
+
+  /** Hand transform per frame: idle + the swing arc (sin, 250 ms). */
+  animateHand (dtMs) {
+    if (!this.handRoot) return
+    if (this.swingT < 1) this.swingT = Math.min(1, this.swingT + dtMs / 250)
+    const s = this.swingT >= 1 ? 0 : Math.sin(this.swingT * Math.PI)
+    this.handRoot.position.set(-s * 0.22, -s * 0.12, s * 0.15)
+    this.handRoot.rotation.set(-s * 0.8, -s * 0.3, 0)
+  }
+
+  // ------------------------------------------------------------------
+  // Mining crack overlay (V1.1.1) — destroy_stage_0..9 over the target
+  // ------------------------------------------------------------------
+
+  /** dig_start from the server: shows the crack overlay on (x,y,z). */
+  handleDigStart (x, y, z, duration) {
+    if (!this.destroyTexture) return
+    if (!Number.isFinite(duration) || duration <= 0) return // instant dig
+    this.digState = { x, y, z, start: performance.now(), duration }
+    if (!this.destroyMesh) {
+      const geo = new THREE.BoxGeometry(1.002, 1.002, 1.002)
+      const mat = new THREE.MeshBasicMaterial({
+        map: this.destroyTexture,
+        transparent: true,
+        depthWrite: false,
+        polygonOffset: true,
+        polygonOffsetFactor: -2
+      })
+      this.destroyMesh = new THREE.Mesh(geo, mat)
+      this.destroyMesh.renderOrder = 998
+      this.destroyMesh.visible = false
+      this.destroyMesh.stage = -1
+      this.scene.add(this.destroyMesh)
+    }
+  }
+
+  /** dig_ok / dig_error / block replaced: hide the overlay. */
+  handleDigEnd () {
+    this.digState = null
+    if (this.destroyMesh) this.destroyMesh.visible = false
+  }
+
+  /** Per-frame crack stage from the dig progress (10 vanilla stages). */
+  updateDigOverlay (now) {
+    if (!this.digState || !this.destroyMesh) return
+    const progress = (now - this.digState.start) / this.digState.duration
+    if (progress > 3) { // safety: the server never confirmed the end
+      this.handleDigEnd()
+      return
+    }
+    const stage = Math.max(0, Math.min(9, Math.floor(progress * 10)))
+    if (this.destroyMesh.stage !== stage) {
+      this.destroyMesh.stage = stage
+      // The sheet is 10 tiles side by side: offset.x selects the stage
+      this.destroyTexture.offset.x = stage / 10
+    }
+    this.destroyMesh.position.set(this.digState.x + 0.5, this.digState.y + 0.5, this.digState.z + 0.5)
+    this.destroyMesh.visible = true
+  }
+
   chunkMaterial () {
     if (!this._material) {
       this._material = new THREE.MeshLambertMaterial({
         map: this.atlasTexture,
-        vertexColors: false,
+        vertexColors: true, // V1.1.1 — biome tint (RGB565 -> per-vertex color)
         alphaTest: 0.1,
         side: THREE.FrontSide,
         transparent: false
@@ -746,7 +1027,18 @@ class Renderer {
       this.highlight = null
     }
     this.updateHighlight(this.highlight)
+    // V1.1.1 — mining crack overlay stage + hand swing, then the two render
+    // passes: world first, then the hand with a CLEARED depth buffer so it
+    // never clips into world geometry (vanilla renders it the same way).
+    this.updateDigOverlay(now)
+    this.animateHand(dtMs)
     this.renderer.render(this.scene, this.camera)
+    if (this.handScene) {
+      this.renderer.autoClear = false
+      this.renderer.clearDepth()
+      this.renderer.render(this.handScene, this.handCamera)
+      this.renderer.autoClear = true
+    }
   }
 
   /** Starts the render loop (bound once — the old code allocated a new

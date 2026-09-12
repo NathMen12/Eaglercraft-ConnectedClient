@@ -723,12 +723,48 @@ function buildItemAtlas (assetsDir, version) {
   }
 }
 
+/**
+ * Destroy-stage overlay sheet (V1.1.1): the 10 vanilla crack textures
+ * (destroy_stage_0..9.png) laid side by side in ONE 160x16 PNG served as
+ * /destroy.png. The client selects the stage by UV offset (tile = stage).
+ * Returns null when the pack has none (the client then skips the overlay).
+ */
+function buildDestroySheet (assetsDir) {
+  try {
+    const tiles = []
+    for (let i = 0; i < 10; i++) {
+      const p = path.join(assetsDir, 'minecraft', 'textures', 'block', `destroy_stage_${i}.png`)
+      if (!fs.existsSync(p)) return null
+      tiles.push(PNG.sync.read(fs.readFileSync(p)))
+    }
+    const sheet = new PNG({ width: 16 * 10, height: 16 })
+    for (let i = 0; i < 10; i++) {
+      const img = tiles[i]
+      for (let y = 0; y < 16; y++) {
+        for (let x = 0; x < 16; x++) {
+          const sIdx = (y * img.width + x) * 4
+          const dIdx = (sheet.width * y + i * 16 + x) * 4
+          sheet.data[dIdx] = img.data[sIdx]
+          sheet.data[dIdx + 1] = img.data[sIdx + 1]
+          sheet.data[dIdx + 2] = img.data[sIdx + 2]
+          sheet.data[dIdx + 3] = img.data[sIdx + 3]
+        }
+      }
+    }
+    return { png: PNG.sync.write(sheet), tiles: 10 }
+  } catch (e) {
+    console.warn('[resourcePack] destroy sheet build failed:', e.message)
+    return null
+  }
+}
+
 module.exports = {
   buildResourcePack,
   buildProceduralAtlas,
   buildHudSheet,
   buildColormaps,
   buildItemAtlas,
+  buildDestroySheet,
   ensureResourcePack,
   findAssetsDir,
   VanillaTextureResolver,

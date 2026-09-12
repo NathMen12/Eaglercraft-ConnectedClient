@@ -32,9 +32,10 @@ La page passe au rendu 3D dès que le bot est connecté.
 | `Shift` | S'accroupir (sneak) — la caméra descend à 1.27 (lissée) |
 | `Ctrl` | Sprinter — la caméra s'élargit (FOV 70° → 77°) |
 | `Souris (clic sur le canvas)` | Capturer la souris — pivoter la caméra (prédiction locale, 0 latence) |
-| `Clic gauche` | Miner le bloc visé (contour noir = ciblage) |
+| `Clic gauche` | Miner le bloc visé (contour noir = ciblage, fissures = progression) |
 | `Clic droit` | Poser le bloc tenu contre la face visée / utiliser l'item |
 | `Molette` / `1`-`9` | Sélectionner un slot de la hotbar |
+| `E` | **Inventaire** — grille 27 + hotbar, déplace les items par 2 clics |
 | `R` | **Recharger les chunks** — vide le cache client (meshes + données) et le set serveur, puis re-scanne tout depuis zéro (fix des blocs fantômes) |
 | `Échap` | Relâcher la souris (stoppe le mouvement) |
 | `T` ou `/` | Ouvrir le chat (`Entrée` envoie, `Échap` annule) |
@@ -166,8 +167,8 @@ node test/e2e.js [host] [port]  # bout-en-bout contre un serveur Minecraft
 
 - Connexion **offline-mode** uniquement (pas d'auth Mojang).
 - Entités rendues en boîtes colorées + nametags (pas de skins/models animés) — v1.2.
-- Inventaire limité à la hotbar (pas d'écran d'inventaire complet ni de déplacement
-  d'items) — v1.2. Le minage n'a pas d'animation de progression (le bloc disparaît
-  quand le bot a fini de le casser).
+- Inventaire : déplacement d'items par paires de clics (pas de drag & drop continu),
+  pas d'armure/craft — v1.2. Le minage n'a pas d'animation de progression côté
+  serveur mais affiche les fissures vanilla côté client.
 - Un bot par onglet navigateur.
 - Versions supportées : celles de Mineflayer (1.8 → 1.21.x, 1.21.10 inclus).

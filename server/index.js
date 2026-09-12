@@ -66,6 +66,8 @@ let hudSheet = null
 // Biome colormaps (grass/foliage) + item atlas — built during boot too.
 let colormaps = null
 let itemAtlas = null
+// Destroy-stage crack sheet (V1.1.1 mining overlay) — built during boot.
+let destroySheet = null
 bootPromise.then(() => {
   if (!config.resourcePackPath) return
   try {
@@ -76,6 +78,8 @@ bootPromise.then(() => {
     colormaps = resourcePack.buildColormaps(assetsDir)
     if (colormaps) console.log('[resourcePack] biome colormaps loaded (grass + foliage)')
     itemAtlas = resourcePack.buildItemAtlas(assetsDir, '1.21.9')
+    destroySheet = resourcePack.buildDestroySheet(assetsDir)
+    if (destroySheet) console.log(`[resourcePack] destroy sheet built (${destroySheet.tiles} stages)`)
   } catch (e) {
     console.warn('[resourcePack] HUD sheet build failed:', e.message)
   }
@@ -104,6 +108,13 @@ app.get('/items.png', (req, res) => {
   res.set('Content-Type', 'image/png')
   res.set('Cache-Control', 'public, max-age=86400')
   res.send(itemAtlas.atlasPng)
+})
+// Destroy-stage crack sheet (mining overlay) — 404 when the pack has none.
+app.get('/destroy.png', (req, res) => {
+  if (!destroySheet) { res.status(404).end(); return }
+  res.set('Content-Type', 'image/png')
+  res.set('Cache-Control', 'public, max-age=86400')
+  res.send(destroySheet.png)
 })
 app.get('/items.json', (req, res) => {
   res.set('Content-Type', 'application/json')
@@ -203,6 +214,9 @@ wss.on('connection', (ws) => {
         break
       case 'slot_select': // hotbar selection (wheel / 1-9 keys)
         handleSlotSelect(ws, msg)
+        break
+      case 'inv_swap': // inventory screen drag & drop (E screen)
+        handleInvSwap(ws, msg)
         break
       default:
         break
@@ -324,7 +338,8 @@ function handleResetChunks (ws) {
 
 /** Left click: mine the block at (x,y,z). One dig at a time per client —
  *  spamming the click while a dig is running would queue dozens of
- *  lookAt/dig chains and jerk the bot's camera around. */
+ *  lookAt/dig chains and jerk the bot's camera around. The client gets a
+ *  dig_start (with digTime) so it can play the crack overlay. */
 function handleDig (ws, msg) {
   const session = manager.sessions.get(ws.id)
   if (!session || !session.bot) return
@@ -339,6 +354,11 @@ function handleDig (ws, msg) {
     return
   }
   session.digInFlight = true
+  // dig_time: lets the client play the crack overlay at the right speed
+  // (vanilla sends the same value in its animation packets).
+  let digTimeMs = 0
+  try { digTimeMs = bot.digTime(block) } catch (e) {}
+  sendJson(ws, { t: 'dig_start', x: pos.x, y: pos.y, z: pos.z, time: digTimeMs })
   bot.lookAt(new Vec3(pos.x + 0.5, pos.y + 0.5, pos.z + 0.5), true).then(() => {
     return bot.dig(block, true)
   }).then(() => {
@@ -427,6 +447,29 @@ function handleSlotSelect (ws, msg) {
     bot.setQuickBarSlot(slot)
     sendJson(ws, { t: 'slot_selected', slot })
   } catch (e) {}
+}
+
+/**
+ * Inventory screen swap (V1.1.1): two clicks on the server-side window —
+ * pick up source, drop on destination. Slots are the bot's inventory
+ * indexes (0-44). In-flight lock: clickWindow chains are async and a
+ * second swap before the first settles corrupts the cursor stack.
+ */
+function handleInvSwap (ws, msg) {
+  const session = manager.sessions.get(ws.id)
+  if (!session || !session.bot) return
+  if (session.invSwapInFlight) return
+  const bot = session.bot
+  const from = Math.floor(Number(msg.from))
+  const to = Math.floor(Number(msg.to))
+  if (!(Number.isFinite(from) && from >= 0 && from <= 44)) return
+  if (!(Number.isFinite(to) && to >= 0 && to <= 44)) return
+  session.invSwapInFlight = true
+  bot.clickWindow(from, 0, 0)
+    .then(() => bot.clickWindow(to, 0, 0))
+    .then(() => sendJson(ws, { t: 'inv_swap_ok', from, to }))
+    .catch((e) => sendJson(ws, { t: 'inv_swap_error', error: e.message || 'swap failed' }))
+    .finally(() => { session.invSwapInFlight = false })
 }
 
 /**
