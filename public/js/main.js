@@ -128,6 +128,31 @@
       renderer.setLocalLook(look.yaw, look.pitch)
       // Sneak (camera dips) & sprint (FOV widens) local feedback
       Game.onSneakSprintChange((sneak, sprint) => renderer.setSneakSprint(sneak, sprint))
+      // V1.1.0 — R key: wipe the client cache; the server (reset_chunks)
+      // wipes its own sent-set and re-streams everything from zero.
+      Game.onReloadChunks(() => renderer.clearAllChunks())
+      // V1.1.0 — mouse attacks: raycast the target locally, then ask the
+      // bot to dig it / place against it (the server does its own reach check)
+      Game.onAttack((kind) => {
+        const target = renderer.highlight
+        if (kind === 'dig') {
+          if (!target) return
+          Net.send({ t: 'dig', x: target.x, y: target.y, z: target.z })
+          return
+        }
+        // Right click — two cases:
+        //   a block is targeted AND the held item can be placed -> place
+        //   otherwise (no target, or a non-block item in hand) -> activate
+        const held = Game.state.hotbar[Game.state.selectedSlot]
+        const heldName = held ? held.name : null
+        if (target && heldName && renderer.isPlaceableItem(heldName)) {
+          Net.send({ t: 'place', x: target.x, y: target.y, z: target.z, face: target.face })
+        } else {
+          Net.send({ t: 'activate' })
+        }
+      })
+      // V1.1.0 — item icons (atlas built by the server from the pack)
+      loadItemIcons()
       // Re-sync the predicted look when the pointer lock is (re)acquired:
       // while unlocked the look follows the server echo, so the prediction
       // must not stay stale from an earlier session.
@@ -212,6 +237,27 @@
       if (renderer && renderer.ready) renderer.handleBlockUpdate(msg.blocks || msg.block)
     })
 
+    // V1.1.0 — inventory / hotbar sync
+    Net.on('hotbar', (msg) => Game.updateHotbar(msg))
+    Net.on('inv_slot', (msg) => {
+      // Server slot indexes: 0-35 main inventory, 36-44 quick bar. Only the
+      // quick-bar range is displayed (hotbar); the rest is kept for the
+      // future full-inventory screen.
+      if (typeof msg.index === 'number' && msg.index >= 36 && msg.index <= 44) {
+        Game.updateHotbarSlot(msg.index - 36, msg.item)
+      }
+    })
+    Net.on('slot_selected', (msg) => {
+      if (typeof msg.slot === 'number') Game.selectHotbarSlot(msg.slot, false)
+    })
+    Net.on('chunks_reset', () => {
+      // Server wiped its sent-set: the client wipes its cache in sync so the
+      // full re-stream rebuilds the world cleanly (phantom-block fix).
+      if (renderer && renderer.ready) renderer.clearAllChunks()
+    })
+    Net.on('dig_error', (msg) => Game.addChatLine(null, `⛏ ${msg.error || 'Minage impossible'}`))
+    Net.on('place_error', (msg) => Game.addChatLine(null, `⚠ ${msg.error || 'Pose impossible'}`))
+
     // Binary chunks
     Net.onBinaryChunk((decoded) => {
       if (renderer && renderer.ready) renderer.handleChunk(decoded)
@@ -225,6 +271,31 @@
       if (res.ok) return await res.json()
     } catch (e) {}
     return {}
+  }
+
+  /**
+   * V1.1.0 — loads the item icon atlas (/items.png + /items.json, both 404
+   * when the pack has no items) and registers the icon provider used by the
+   * hotbar. Without an atlas the hotbar shows plain slots (no crash).
+   */
+  async function loadItemIcons () {
+    try {
+      const [jsonRes, pngRes] = await Promise.all([
+        fetch('/items.json'),
+        fetch('/items.png')
+      ])
+      if (!jsonRes.ok || !pngRes.ok) return
+      const meta = await jsonRes.json()
+      if (!meta || !meta.items) return
+      const blob = await pngRes.blob()
+      const url = URL.createObjectURL(blob)
+      const items = meta.items
+      Game.setItemIconProvider((name) => {
+        const tile = items[name]
+        return tile === undefined ? null : { url, tile }
+      })
+      Game.renderHotbar() // re-render with textures if the hotbar was already drawn
+    } catch (e) { /* no icons — the hotbar stays text-only */ }
   }
 
   function showError (title, detail) {

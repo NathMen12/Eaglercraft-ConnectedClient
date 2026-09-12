@@ -16,7 +16,34 @@ const Game = (() => {
     yaw: 0, pitch: 0,
     health: 20, food: 20,
     position: { x: 0, y: 0, z: 0 },
-    chatOpen: false
+    chatOpen: false,
+    // V1.1.0 — hotbar / inventory state (kept in sync by main.js)
+    hotbar: new Array(9).fill(null), // [{ name, count }] | null
+    selectedSlot: 0
+  }
+
+  // Hotbar DOM signature — avoids rebuilding identical slots (see renderHotbar).
+  // Declared here (not near renderHotbar) so start() can reset it without TDZ.
+  let lastHotbarSignature = ''
+
+  // Inventory item icon providers — set by main.js once the item atlas is
+  // loaded (name -> { url, tile } or null when the server has none).
+  let itemIconProvider = null
+  function setItemIconProvider (fn) { itemIconProvider = fn }
+  function getItemIcon (name) { return itemIconProvider ? itemIconProvider(name) : null }
+
+  /**
+   * Hotbar selection. notifyServer=false when the change originates from a
+   * server echo (slot_selected) — pushing it back would loop.
+   */
+  function selectHotbarSlot (slot, notifyServer = true) {
+    slot = ((slot % 9) + 9) % 9
+    if (slot === state.selectedSlot) return
+    state.selectedSlot = slot
+    renderHotbar()
+    if (notifyServer && typeof Net !== 'undefined' && Net.isOpen()) {
+      Net.send({ t: 'slot_select', slot })
+    }
   }
 
   // Send control states at ~10 Hz — but only when something actually changed
@@ -40,6 +67,15 @@ const Game = (() => {
   let lookCallback = null
   function onLookChange (fn) { lookCallback = fn }
 
+  // R key: the client wipes its whole chunk cache too (see onKeyDown).
+  let reloadChunksCallback = null
+  function onReloadChunks (fn) { reloadChunksCallback = fn }
+
+  // Mouse buttons (V1.1.0): dig / place-use — wired to the raycast target
+  // provided by the renderer (block + face) via onAttack callback.
+  let attackCallback = null
+  function onAttack (fn) { attackCallback = fn }
+
   // Sneak/sprint state callbacks: the renderer dips the camera when
   // sneaking and widens the FOV when sprinting (local feedback, no latency)
   let sneakSprintCallback = null
@@ -54,6 +90,12 @@ const Game = (() => {
     state.active = true
     bindEvents()
     loadHudSprites() // async, emoji fallback until loaded
+    // Reset the V1.1.0 interaction state for a fresh session: a second login
+    // (same tab, back from the menu) must not keep the previous hotbar.
+    state.hotbar = new Array(9).fill(null)
+    state.selectedSlot = 0
+    lastHotbarSignature = '' // force a hotbar re-render
+    renderHotbar()
     requestAnimationFrame(tick)
   }
 
@@ -89,6 +131,22 @@ const Game = (() => {
     if (e.code === 'KeyT' || e.code === 'Slash') {
       e.preventDefault()
       openChat(e.code === 'Slash' ? '/' : '')
+      return
+    }
+    if (e.code === 'KeyR') {
+      // Full chunk reload: wipes the client cache (meshes + decoded data) and
+      // the server's sent-set, then everything is re-scanned from zero — the
+      // fix for client-side "phantom blocks" desyncs.
+      e.preventDefault()
+      if (typeof Net !== 'undefined' && Net.isOpen()) Net.send({ t: 'reset_chunks' })
+      if (reloadChunksCallback) reloadChunksCallback()
+      addChatLine(null, 'Rechargement des chunks…')
+      return
+    }
+    // Hotbar slots 1-9 (vanilla binding)
+    if (/^Digit[1-9]$/.test(e.code)) {
+      e.preventDefault()
+      selectHotbarSlot(parseInt(e.code.slice(5), 10) - 1)
       return
     }
     if (e.code === 'Escape') {
@@ -152,6 +210,35 @@ const Game = (() => {
       document.getElementById('game-canvas').requestPointerLock()
     }
   }
+
+  /**
+   * Mouse buttons (V1.1.0), only while the pointer is locked:
+   *   left  (button 0) -> mine the targeted block
+   *   right (button 2)  -> place the held block against the targeted face
+   *                        (or "activate" when nothing is held / in hand)
+   * The click itself acquires the pointer lock when it is not held yet.
+   */
+  function onMouseDown (e) {
+    if (!state.active || state.chatOpen) return
+    if (!document.pointerLockElement) return // first click only locks
+    e.preventDefault()
+    if (!attackCallback) return
+    if (e.button === 0) {
+      attackCallback('dig')
+    } else if (e.button === 2) {
+      attackCallback('place')
+    }
+  }
+
+  // Hotbar wheel (vanilla: scroll up = previous slot, down = next)
+  function onWheel (e) {
+    if (!state.active || state.chatOpen) return
+    if (!document.pointerLockElement) return
+    e.preventDefault()
+    selectHotbarSlot(state.selectedSlot + (e.deltaY > 0 ? 1 : -1))
+  }
+
+  function onContextMenu (e) { e.preventDefault() }
 
   function onPointerLockChange () {
     // When lock is lost we stop moving so the bot doesn't run away
@@ -281,6 +368,71 @@ const Game = (() => {
     renderHealthHud()
   }
 
+  // ------------------------------------------------------------------
+  // Hotbar (V1.1.0)
+  // ------------------------------------------------------------------
+
+  /** Rebuilds the 9 hotbar slot elements (idempotent, throttled by signature). */
+  function renderHotbar () {
+    const bar = document.getElementById('hotbar')
+    if (!bar) return
+    // Signature = slots content + selection: skip identical DOM rebuilds
+    const sig = state.selectedSlot + '|' + state.hotbar.map((s) => s ? `${s.name}:${s.count}` : '-').join(',')
+    if (sig === lastHotbarSignature) return
+    lastHotbarSignature = sig
+    bar.innerHTML = ''
+    for (let i = 0; i < 9; i++) {
+      const slot = document.createElement('div')
+      slot.className = 'hotbar-slot' + (i === state.selectedSlot ? ' selected' : '')
+      const item = state.hotbar[i]
+      if (item) {
+        const icon = getItemIcon(item.name)
+        if (icon) {
+          const img = document.createElement('div')
+          img.className = 'hotbar-icon'
+          img.style.backgroundImage = `url(${icon.url})`
+          // Icon tile position in the 64x64 atlas (16px tiles, 2x upscale)
+          const tx = (icon.tile % 64) * 32
+          const ty = Math.floor(icon.tile / 64) * 32
+          img.style.backgroundPosition = `-${tx}px -${ty}px`
+          img.style.backgroundSize = '2048px 2048px'
+          slot.appendChild(img)
+        } else {
+          const fallback = document.createElement('div')
+          fallback.className = 'hotbar-icon hotbar-icon-fallback'
+          slot.appendChild(fallback)
+        }
+        if (item.count > 1) {
+          const count = document.createElement('span')
+          count.className = 'hotbar-count'
+          count.textContent = item.count > 99 ? '99+' : String(item.count)
+          slot.appendChild(count)
+        }
+      }
+      // Slot number (vanilla-like, only on the selected one for now)
+      if (i === state.selectedSlot) slot.title = `Slot ${i + 1}`
+      bar.appendChild(slot)
+    }
+  }
+
+  /** Full hotbar update from a server {t:'hotbar'} snapshot. */
+  function updateHotbar (msg) {
+    if (!Array.isArray(msg.slots) || msg.slots.length !== 9) return
+    state.hotbar = msg.slots.map((s) => s ? { name: s.name, count: s.count } : null)
+    if (typeof msg.selected === 'number' && msg.selected >= 0 && msg.selected <= 8) {
+      state.selectedSlot = msg.selected
+    }
+    renderHotbar()
+  }
+
+  /** Single quick-bar item change (server 'inv_slot' with index 36-44, or a
+   *  full hotbar push — main.js translates and calls this). */
+  function updateHotbarSlot (index, item) {
+    if (index < 0 || index > 8) return
+    state.hotbar[index] = item ? { name: item.name, count: item.count } : null
+    renderHotbar()
+  }
+
   function renderHealthHud () {
     // Hearts (health / 2, half hearts supported)
     const heartsEl = document.getElementById('hearts')
@@ -384,6 +536,9 @@ const Game = (() => {
     document.addEventListener('keyup', onKeyUp)
     document.addEventListener('mousemove', onMouseMove)
     document.addEventListener('pointerlockchange', onPointerLockChange)
+    document.addEventListener('mousedown', onMouseDown)
+    document.addEventListener('wheel', onWheel, { passive: false })
+    document.addEventListener('contextmenu', onContextMenu)
     document.getElementById('game-canvas').addEventListener('click', onCanvasClick)
     document.getElementById('chat-input').addEventListener('keydown', onChatInputKey)
   }
@@ -395,12 +550,19 @@ const Game = (() => {
     document.removeEventListener('keyup', onKeyUp)
     document.removeEventListener('mousemove', onMouseMove)
     document.removeEventListener('pointerlockchange', onPointerLockChange)
+    document.removeEventListener('mousedown', onMouseDown)
+    document.removeEventListener('wheel', onWheel)
+    document.removeEventListener('contextmenu', onContextMenu)
   }
 
   return {
     start, stop, isActive, state,
     updateHud, addChatLine, updateDebug, setPosition, setLook, getLook,
-    onLookChange, onSneakSprintChange
+    onLookChange, onSneakSprintChange,
+    // V1.1.0 — chunk reload, mouse attacks, hotbar
+    onReloadChunks, onAttack,
+    updateHotbar, updateHotbarSlot, selectHotbarSlot, renderHotbar,
+    setItemIconProvider
   }
 })()
 

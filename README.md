@@ -31,7 +31,11 @@ La page passe au rendu 3D dès que le bot est connecté.
 | `Espace` | Sauter |
 | `Shift` | S'accroupir (sneak) — la caméra descend à 1.27 (lissée) |
 | `Ctrl` | Sprinter — la caméra s'élargit (FOV 70° → 77°) |
-| Souris (clic sur le canvas) | Capturer la souris — pivoter la caméra (prédiction locale, 0 latence) |
+| `Souris (clic sur le canvas)` | Capturer la souris — pivoter la caméra (prédiction locale, 0 latence) |
+| `Clic gauche` | Miner le bloc visé (contour noir = ciblage) |
+| `Clic droit` | Poser le bloc tenu contre la face visée / utiliser l'item |
+| `Molette` / `1`-`9` | Sélectionner un slot de la hotbar |
+| `R` | **Recharger les chunks** — vide le cache client (meshes + données) et le set serveur, puis re-scanne tout depuis zéro (fix des blocs fantômes) |
 | `Échap` | Relâcher la souris (stoppe le mouvement) |
 | `T` ou `/` | Ouvrir le chat (`Entrée` envoie, `Échap` annule) |
 
@@ -128,20 +132,22 @@ Client :
 
 ```
 server/
-  index.js         Express (static + /atlas.png + /blocks.json) + WebSocket /ws
+  index.js         Express (static + /atlas.png + /blocks.json + /items.png) + WebSocket /ws
   config.js        Configuration (env vars)
   botManager.js    File d'attente + cycle de vie des bots Mineflayer
   worldStreamer.js Culling des faces visibles + sérialisation binaire + deflate
-  resourcePack.js  Atlas de textures (pack vanilla ou procédural)
+  resourcePack.js  Atlas de textures (pack vanilla ou procédural) + atlas d'items + HUD
 public/
   js/net.js        Client WebSocket (JSON + binaire + DecompressionStream)
-  js/chunkCodec.js Décodeur du format binaire des chunks
+  js/chunkCodec.js Décodeur du format binaire des chunks (v1 & v2 tint)
+  js/voxelRaycast.js Raycast DDA voxel (ciblage des blocs — testé unitairement)
   js/menu.js       Liste des serveurs (localStorage) + formulaire
-  js/game.js       Contrôles clavier/souris, HUD, chat
-  js/renderer.js   Rendu Three.js : chunks, entités, caméra
+  js/game.js       Contrôles clavier/souris, HUD, chat, hotbar
+  js/renderer.js   Rendu Three.js : chunks, entités, caméra, ciblage + contour
   js/main.js       Orchestration des écrans et du câblage
 test/
   streamer.test.js Test unitaire du culling/streaming (sans serveur MC)
+  raycast.test.js  Test unitaire du raycast DDA (ciblage, faces, transparence)
   queue.test.js    Test unitaire de la file d'attente
   e2e.js           Test E2E WebSocket → bot Mineflayer → streaming
 ```
@@ -149,7 +155,8 @@ test/
 ## Tests
 
 ```bash
-node test/streamer.test.js   # culling + sérialisation binaire (aucun serveur nécessaire)
+node test/streamer.test.js   # culling + sérialisation binaire + codec client (aucun serveur nécessaire)
+node test/raycast.test.js    # raycast DDA : faces, blocs transparents, portée
 node test/queue.test.js      # file d'attente et promotion
 node test/bench.streamer.js  # benchmark du scan de chunks (ms/chunk)
 node test/e2e.js [host] [port]  # bout-en-bout contre un serveur Minecraft
@@ -158,7 +165,9 @@ node test/e2e.js [host] [port]  # bout-en-bout contre un serveur Minecraft
 ## Limitations connues
 
 - Connexion **offline-mode** uniquement (pas d'auth Mojang).
-- Entités rendues en boîtes colorées + nametags (pas de skins/models animés) — v1.
-- Pas d'inventaire interactif, pas de minage/pose de blocs — v1.
+- Entités rendues en boîtes colorées + nametags (pas de skins/models animés) — v1.2.
+- Inventaire limité à la hotbar (pas d'écran d'inventaire complet ni de déplacement
+  d'items) — v1.2. Le minage n'a pas d'animation de progression (le bloc disparaît
+  quand le bot a fini de le casser).
 - Un bot par onglet navigateur.
 - Versions supportées : celles de Mineflayer (1.8 → 1.21.x, 1.21.10 inclus).

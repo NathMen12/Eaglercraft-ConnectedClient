@@ -218,7 +218,7 @@ input:focus { border-color: var(--accent); }
 #chat-input-row { margin-top: 4px; }
 #chat-input { background: rgba(0,0,0,.6); }
 
-/* Hotbar (visual placeholder) */
+/* Hotbar (V1.1.0 — real items, icons, counts, selection) */
 #hotbar {
   position: absolute; bottom: 8px; left: 50%;
   transform: translateX(-50%);
@@ -226,10 +226,31 @@ input:focus { border-color: var(--accent); }
   pointer-events: none;
 }
 .hotbar-slot {
+  position: relative;
   width: 44px; height: 44px;
   background: rgba(0,0,0,.5);
   border: 2px solid #555;
   border-radius: 4px;
+}
+.hotbar-slot.selected {
+  border-color: #fff;
+  box-shadow: 0 0 0 2px rgba(255,255,255,.35);
+  background: rgba(30,30,30,.6);
+}
+.hotbar-icon {
+  position: absolute; inset: 4px;
+  background-repeat: no-repeat;
+  image-rendering: pixelated;
+}
+.hotbar-icon-fallback {
+  background: linear-gradient(135deg, #6b6b78, #494952);
+  border-radius: 3px;
+}
+.hotbar-count {
+  position: absolute; right: 3px; bottom: 1px;
+  font-size: 13px; font-weight: 700;
+  color: #fff; text-shadow: 1px 1px 1px #000;
+  pointer-events: none;
 }
 
 /* ---------- Error screen ---------- */

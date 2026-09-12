@@ -13,6 +13,13 @@ const assert = require('assert')
 const zlib = require('zlib')
 const mcDataLoader = require('minecraft-data')
 const { WorldStreamer } = require('../server/worldStreamer')
+// Load the REAL client codec (public/js/chunkCodec.js) so this test exercises
+// the exact browser decode path, not a re-implementation.
+const codecSrc = require('fs').readFileSync(require('path').join(__dirname, '..', 'public', 'js', 'chunkCodec.js'), 'utf8')
+const sandboxWindow = {}
+new Function('window', 'module', codecSrc)(sandboxWindow, undefined)
+const ChunkCodec = sandboxWindow.ChunkCodec
+assert(ChunkCodec && typeof ChunkCodec.decodeChunk === 'function', 'client ChunkCodec loaded')
 
 const mcData = mcDataLoader('1.21.9')
 const ChunkColumn = require('prismarine-chunk')('1.21.9')
@@ -57,7 +64,15 @@ assert(payload, 'serializeChunk returned a payload')
 assert(Buffer.isBuffer(payload), 'payload is a Buffer')
 
 const raw = zlib.inflateSync(payload)
-assert.strictEqual(raw.readUInt8(0), 1, 'format version is 1')
+assert.strictEqual(raw.readUInt8(0), 2, 'format version is 2 (biome tint)')
+
+// Decode through the REAL client codec — this is the browser pipeline.
+const decoded = ChunkCodec.decodeChunk(new Uint8Array(raw))
+console.log('✓ client codec decodes the v2 payload:', JSON.stringify({
+  chunkX: decoded.chunkX, chunkZ: decoded.chunkZ, minY: decoded.minY, count: decoded.count
+}))
+assert(decoded.entries.length === decoded.count, 'decoded count matches header')
+assert(decoded.entries.every((e) => typeof e.tint === 'number'), 'entries carry the tint field')
 
 const chunkX = raw.readInt32LE(1)
 const chunkZ = raw.readInt32LE(5)
@@ -69,7 +84,7 @@ assert.strictEqual(payloadMinY, minY)
 assert(count > 0, 'chunk has visible blocks')
 console.log(`✓ chunk serialized: ${count} visible blocks, ${payload.length} bytes compressed (vs ${raw.length} raw, ${16 * 16 * 84} total blocks in column)`)
 
-// --- Decode entries ------------------------------------------------------
+// --- Decode entries (raw manual read, cross-checks the client codec) ------
 let o = 15
 const blocks = []
 for (let i = 0; i < count; i++) {
@@ -78,11 +93,21 @@ for (let i = 0; i < count; i++) {
   const z = raw.readUInt8(o); o += 1
   const blockId = raw.readUInt16LE(o); o += 2
   const faceMask = raw.readUInt8(o); o += 1
+  o += 2 // v2 tint (RGB565)
   blocks.push({ x, y, z, blockId, faceMask })
 }
 
 // Every entry must be decodable and consistent
 assert.strictEqual(o, raw.length, 'payload fully consumed')
+// Cross-check: the manual raw read and the REAL client codec must agree
+assert.strictEqual(blocks.length, decoded.entries.length, 'manual decode === client codec count')
+for (let i = 0; i < blocks.length; i++) {
+  const a = blocks[i]
+  const b = decoded.entries[i]
+  assert.strictEqual(a.x, b.x); assert.strictEqual(a.y, b.y); assert.strictEqual(a.z, b.z)
+  assert.strictEqual(a.blockId, b.blockId); assert.strictEqual(a.faceMask, b.faceMask)
+}
+console.log('✓ client codec output === manual raw decode (every field, every entry)')
 
 // The grass block layer (y=21 local y=21-minY) must be visible with the top
 // face (+Y bit 4) set; blocks below it hidden (faceMask without top bit)

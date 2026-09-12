@@ -201,6 +201,9 @@ wss.on('connection', (ws) => {
       case 'activate':
         handleActivate(ws, msg)
         break
+      case 'slot_select': // hotbar selection (wheel / 1-9 keys)
+        handleSlotSelect(ws, msg)
+        break
       default:
         break
     }
@@ -319,10 +322,13 @@ function handleResetChunks (ws) {
   }
 }
 
-/** Left click: mine the block at (x,y,z). Uses the bot's reach safety. */
+/** Left click: mine the block at (x,y,z). One dig at a time per client —
+ *  spamming the click while a dig is running would queue dozens of
+ *  lookAt/dig chains and jerk the bot's camera around. */
 function handleDig (ws, msg) {
   const session = manager.sessions.get(ws.id)
   if (!session || !session.bot) return
+  if (session.digInFlight) return
   const bot = session.bot
   const pos = validBlockCoords(msg)
   if (!pos) return
@@ -332,13 +338,17 @@ function handleDig (ws, msg) {
     sendJson(ws, { t: 'dig_error', error: 'Block not found / out of reach' })
     return
   }
+  session.digInFlight = true
   bot.lookAt(new Vec3(pos.x + 0.5, pos.y + 0.5, pos.z + 0.5), true).then(() => {
     return bot.dig(block, true)
   }).then(() => {
     sendJson(ws, { t: 'dig_ok' })
-    // Attach/dig already streams the block_update via the world listener
+    // The world listener streams the block_update (the bot's own view is
+    // authoritative — no client-side ghost prediction on failure).
   }).catch((e) => {
     sendJson(ws, { t: 'dig_error', error: e.message || 'dig failed' })
+  }).finally(() => {
+    session.digInFlight = false
   })
 }
 
@@ -385,6 +395,47 @@ function handleActivate (ws, msg) {
   } catch (e) {
     sendJson(ws, { t: 'activate_error', error: e.message || 'activate failed' })
   }
+}
+
+// ---------------------------------------------------------------------------
+// Inventory (hotbar) relays — V1.1.0
+// ---------------------------------------------------------------------------
+
+/** Serializes an inventory item (null when the slot is empty). */
+function serializeItem (item) {
+  if (!item) return null
+  return { name: item.name, count: item.count }
+}
+
+/** Hotbar snapshot: the 9 quick-bar slots + the selected one. */
+function hotbarPayload (bot) {
+  const slots = []
+  for (let i = 0; i < 9; i++) {
+    slots.push(serializeItem(bot.inventory.slots[bot.QUICK_BAR_START + i]))
+  }
+  return { t: 'hotbar', slots, selected: bot.quickBarSlot ?? 0 }
+}
+
+/** Selects a hotbar slot (0-8) — the wheel / 1-9 keys on the client. */
+function handleSlotSelect (ws, msg) {
+  const session = manager.sessions.get(ws.id)
+  if (!session || !session.bot) return
+  const bot = session.bot
+  const slot = Math.floor(Number(msg.slot))
+  if (!(Number.isFinite(slot) && slot >= 0 && slot <= 8)) return
+  try {
+    bot.setQuickBarSlot(slot)
+    sendJson(ws, { t: 'slot_selected', slot })
+  } catch (e) {}
+}
+
+/**
+ * Inventory slots 0-35 (crafting/armor slots excluded): every item change
+ * (pick up, place, drop, server /give...) pushes {t:'inv_slot'}.
+ */
+function sendInvSlot (ws, bot, index) {
+  const slot = serializeItem(bot.inventory.slots[index])
+  sendJson(ws, { t: 'inv_slot', index, item: slot })
 }
 
 // ---------------------------------------------------------------------------
@@ -644,6 +695,26 @@ function attachWorldStreaming (socket, session, mcData) {
 
 function attachBotEvents (socket, session) {
   const bot = session.bot
+
+  // --- Inventory / hotbar (V1.1.0) ------------------------------------------
+  // Initial snapshot then incremental pushes: heldItemChanged covers quick-bar
+  // slot switches; updateSlot covers every inventory slot change (picked-up
+  // loot, /give, container moves, the initial window_items packet...).
+  // Slot layout (server-side indexes): 0-35 main inventory, 36-44 quick bar.
+  const QUICK_BAR_START = bot.QUICK_BAR_START
+  const pushHotbar = () => sendJson(socket, hotbarPayload(bot))
+  const onHeldItemChanged = () => pushHotbar()
+  const onInvUpdateSlot = (index) => {
+    if (index >= 0 && index <= QUICK_BAR_START + 8) sendInvSlot(socket, bot, index)
+  }
+  bot.on('heldItemChanged', onHeldItemChanged)
+  bot.inventory.on('updateSlot', onInvUpdateSlot)
+  session.cleanup.push(() => {
+    bot.off('heldItemChanged', onHeldItemChanged)
+    bot.inventory.off('updateSlot', onInvUpdateSlot)
+  })
+  pushHotbar()
+  for (let i = 0; i <= QUICK_BAR_START + 8; i++) sendInvSlot(socket, bot, i)
 
   // --- Position (throttled ~20 Hz) ---------------------------------------
   let lastPosSent = 0

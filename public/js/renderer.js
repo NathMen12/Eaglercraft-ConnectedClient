@@ -105,6 +105,9 @@ class Renderer {
     this.sneaking = false   // eye height dips to 1.27 while sneaking
     this.sprinting = false  // FOV widens to 77° while sprinting
     this.eyeHeight = 1.62   // smoothed current eye height
+    // V1.1.0 — block targeting: last raycast hit + its wireframe box
+    this.highlight = null      // { x, y, z, face, name } | null
+    this.highlightMesh = null  // THREE.LineSegments (black wireframe)
   }
 
   async init (loginMsg) {
@@ -232,6 +235,28 @@ class Renderer {
   }
 
   /**
+   * R key / server reset: wipes EVERYTHING (meshes + decoded chunk data +
+   * dirty set) so the full re-stream rebuilds the world from zero — the fix
+   * for client-side phantom blocks.
+   */
+  clearAllChunks () {
+    for (const mesh of this.chunks.values()) {
+      this.scene.remove(mesh)
+      mesh.geometry.dispose()
+    }
+    this.chunks.clear()
+    this.chunkBlocks.clear() // drops the per-chunk entry indexes too
+    this.dirtyChunks.clear()
+    this.highlight = null
+    if (this.highlightMesh) {
+      this.scene.remove(this.highlightMesh)
+      this.highlightMesh.geometry.dispose()
+      this.highlightMesh.material.dispose()
+      this.highlightMesh = null
+    }
+  }
+
+  /**
    * Builds a single BufferGeometry mesh for a chunk from visible blocks.
    * faceMask bits: 1=+X, 2=-X, 4=+Y, 8=-Y, 16=+Z, 32=-Z
    */
@@ -338,6 +363,97 @@ class Renderer {
     this.blockIdToName = namesById
   }
 
+  // ------------------------------------------------------------------
+  // Block targeting (V1.1.0) — DDA voxel raycast from the camera
+  // ------------------------------------------------------------------
+
+  /**
+   * Raycast through the loaded chunk data (NOT the GPU meshes — invisible
+   * faces are missing from them). The traversal itself lives in
+   * voxelRaycast.js (shared with the unit tests); this wrapper feeds it
+   * the camera ray and the chunk-data block lookup.
+   *
+   * Returns { x, y, z, face, name } or null. Blocks the ray passes THROUGH:
+   * cross-shaped plants & (semi-)transparent blocks (glass, water...) —
+   * exactly like vanilla's "passable" targets.
+   */
+  raycastBlocks (maxDistance = 4.5) {
+    if (!this.camera || !this.blockIdToName || !window.VoxelRaycast) return null
+    const origin = this.camera.position
+    const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion)
+    const hit = window.VoxelRaycast.raycast(origin, dir, maxDistance, (x, y, z) => {
+      const block = this.blockAtVoxel(x, y, z)
+      return !!(block && this.isTargetable(block.name))
+    })
+    if (!hit) return null
+    const block = this.blockAtVoxel(hit.x, hit.y, hit.z)
+    return { x: hit.x, y: hit.y, z: hit.z, face: hit.face, name: block.name }
+  }
+
+  /** Decoded-entry lookup for the world voxel (x,y,z), or null. */
+  blockAtVoxel (x, y, z) {
+    const key = `${x >> 4},${z >> 4}`
+    const data = this.chunkBlocks.get(key)
+    if (!data) return null
+    if (!data.index) this.ensureChunkIndex(data)
+    const localY = y - data.minY
+    if (localY < 0 || localY > 4095) return null // index key packing limit
+    const entry = data.index.get((x & 15) * 65536 + localY * 16 + (z & 15))
+    if (!entry) return null
+    const name = this.blockIdToName[entry.blockId]
+    return name ? { name, blockId: entry.blockId } : null
+  }
+
+  /** Lazily builds the local (x,y,z) -> entry index of a decoded chunk. */
+  ensureChunkIndex (data) {
+    if (data.index) return data.index
+    data.index = new Map()
+    for (const e of data.entries) {
+      if (e.y < 4096) data.index.set(e.x * 65536 + e.y * 16 + e.z, e)
+    }
+    return data.index
+  }
+
+  /**
+   * Can the player interact with this block? Cross plants & transparent
+   * blocks are see-through in vanilla (ray continues past them).
+   */
+  isTargetable (name) {
+    const info = this.blockMappings[name]
+    if (info) {
+      if (info.cross) return false
+      if (info.opacity !== undefined && info.opacity < 1) return false
+    }
+    return true
+  }
+
+  /**
+   * Is this HELD item name a placeable block? (Vanilla block items share the
+   * block's name — 'dirt' places dirt, 'stone' places stone. Tools/food have
+   * no block counterpart and are "used" instead of placed.)
+   */
+  isPlaceableItem (name) {
+    return !!(this.blockMappings && this.blockMappings[name])
+  }
+
+  /** Black wireframe box on the targeted block (vanilla-style feedback). */
+  updateHighlight (target) {
+    if (!this.highlightMesh) {
+      const geo = new THREE.BoxGeometry(1.002, 1.002, 1.002)
+      const mat = new THREE.LineBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.6 })
+      this.highlightMesh = new THREE.LineSegments(new THREE.EdgesGeometry(geo), mat)
+      this.highlightMesh.renderOrder = 999
+      this.scene.add(this.highlightMesh)
+      geo.dispose() // EdgesGeometry holds its own copy
+    }
+    if (target) {
+      this.highlightMesh.visible = true
+      this.highlightMesh.position.set(target.x + 0.5, target.y + 0.5, target.z + 0.5)
+    } else {
+      this.highlightMesh.visible = false
+    }
+  }
+
   chunkMaterial () {
     if (!this._material) {
       this._material = new THREE.MeshLambertMaterial({
@@ -366,10 +482,7 @@ class Renderer {
       // Lazily built & maintained index: local (x,y,z) -> entry (the old
       // code ran a findIndex over ALL chunk entries for EVERY block — with
       // 30k entries per chunk that froze the frame on world edits).
-      if (!data.index) {
-        data.index = new Map()
-        for (const e of data.entries) data.index.set(e.x * 65536 + e.y * 16 + e.z, e)
-      }
+      if (!data.index) this.ensureChunkIndex(data)
       const localX = block.x & 15
       const localZ = block.z & 15
       const localY = block.y - data.minY
@@ -624,6 +737,15 @@ class Renderer {
     // Camera: applied EVERY frame with the local (predicted) look and a
     // smoothed position — never at the 20 Hz network rate.
     this.applyCameraEachFrame(this.serverYaw, this.serverPitch, dtMs)
+    // V1.1.0 — block targeting: raycast from the (just-updated) camera and
+    // refresh the wireframe box. Only while the mouse drives the camera:
+    // without the pointer lock the crosshair is not on screen.
+    if (document.pointerLockElement) {
+      this.highlight = this.raycastBlocks()
+    } else {
+      this.highlight = null
+    }
+    this.updateHighlight(this.highlight)
     this.renderer.render(this.scene, this.camera)
   }
 

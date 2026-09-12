@@ -6,11 +6,12 @@
  * Decodes the compact binary chunk format produced by
  * server/worldStreamer.js:
  *
- *   u8  version = 1
+ *   u8  version = 1 (7 B/entry) or 2 (9 B/entry)
  *   i32 chunkX, i32 chunkZ, i32 minY
  *   u16 blockCount
  *   blockCount * entry:
- *     u8 localX, u16 localY, u8 localZ, u16 blockId, u8 faceMask
+ *     v1: u8 localX, u16 localY, u8 localZ, u16 blockId, u8 faceMask
+ *     v2: same + u16 tint (packed RGB565, 0 = untinted)
  *
  * All integers are little-endian.
  */
@@ -30,12 +31,14 @@ const ChunkCodec = (() => {
     if (buf.length < 15) throw new Error('chunk payload too short')
     let o = 0
     const version = buf[o]; o += 1
-    if (version !== 1) throw new Error(`unsupported chunk format version ${version}`)
+    // v1 = 7 B/entry (no tint), v2 = 9 B/entry (biome tint RGB565)
+    const entrySize = version === 2 ? 9 : version === 1 ? 7 : null
+    if (entrySize === null) throw new Error(`unsupported chunk format version ${version}`)
     const chunkX = readInt32(buf, o); o += 4
     const chunkZ = readInt32(buf, o); o += 4
     const minY = readInt32(buf, o); o += 4
     const count = readUint16(buf, o); o += 2
-    if (buf.length < o + count * 7) throw new Error('chunk payload truncated')
+    if (buf.length < o + count * entrySize) throw new Error('chunk payload truncated')
     const entries = new Array(count)
     for (let i = 0; i < count; i++) {
       const x = buf[o]; o += 1
@@ -43,7 +46,9 @@ const ChunkCodec = (() => {
       const z = buf[o]; o += 1
       const blockId = readUint16(buf, o); o += 2
       const faceMask = buf[o]; o += 1
-      entries[i] = { x, y, z, blockId, faceMask }
+      const tint = version === 2 ? readUint16(buf, o) : 0
+      o += entrySize - 7 // 0 for v1, 2 (tint) for v2
+      entries[i] = { x, y, z, blockId, faceMask, tint }
     }
     return { chunkX, chunkZ, minY, count, entries }
   }
