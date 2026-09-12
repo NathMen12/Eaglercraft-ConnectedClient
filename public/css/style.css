@@ -179,11 +179,22 @@ input:focus { border-color: var(--accent); }
   position: absolute; bottom: 76px; left: 50%;
   transform: translateX(-50%);
   pointer-events: none;
+  display: flex; flex-direction: column; align-items: center; gap: 2px;
 }
-#hearts { display: flex; gap: 2px; }
-.heart { width: 18px; height: 18px; position: relative; }
+#hearts, #food { display: flex; gap: 1px; }
+#food { flex-direction: row-reverse; } /* vanilla: food drains right-to-left */
+.heart, .food-icon {
+  width: 18px; height: 18px; position: relative;
+  background-repeat: no-repeat;
+  background-size: 18px 18px;
+  image-rendering: pixelated;
+}
+/* Emoji fallback (used when the server has no HUD sprites) */
 .heart::before { content: '❤'; font-size: 18px; color: var(--heart); }
 .heart.empty::before { color: #3a1116; }
+.heart.textured::before, .food-icon.textured::before { content: none; }
+/* Textured mode: sprites come from /hud.png via inline background-image
+   set by JS; CSS only provides sizing + the pixelated upscale. */
 
 /* Chat */
 #chat-area {

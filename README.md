@@ -29,9 +29,9 @@ La page passe au rendu 3D dès que le bot est connecté.
 |---|---|
 | `Z`/`W` `S` `Q`/`A` `D` | Déplacements (détection physique des deux layouts) |
 | `Espace` | Sauter |
-| `Shift` | S'accroupir (sneak) |
-| `Ctrl` | Sprinter |
-| Souris (clic sur le canvas) | Capturer la souris — pivoter la caméra |
+| `Shift` | S'accroupir (sneak) — la caméra descend à 1.27 (lissée) |
+| `Ctrl` | Sprinter — la caméra s'élargit (FOV 70° → 77°) |
+| Souris (clic sur le canvas) | Capturer la souris — pivoter la caméra (prédiction locale, 0 latence) |
 | `Échap` | Relâcher la souris (stoppe le mouvement) |
 | `T` ou `/` | Ouvrir le chat (`Entrée` envoie, `Échap` annule) |
 
@@ -62,13 +62,23 @@ de `MAX_QUEUE_SIZE` sont rejetées immédiatement.
 
 Le serveur génère un **atlas de textures** au démarrage :
 
-1. Si un pack est présent (`RESOURCE_PACK_PATH` ou dossier `./resourcepack`), extrait les
-   textures `assets/minecraft/textures/block/*.png` et les assemble dans un atlas PNG
-   servi sur `/atlas.png`.
-2. Sans pack, un atlas **procédural** (couleurs + bruit par bloc) est généré — le client
-   fonctionne sans aucun asset.
+1. **Téléchargement automatique** : si aucun pack n'est présent, le serveur télécharge le pack
+   de ressources vanilla (URL configurable via `RESOURCE_PACK_URL`) et extrait blockstates,
+   models, textures de blocs et sprites HUD au premier boot.
+2. Si un pack est présent (`RESOURCE_PACK_PATH` ou dossier `./resourcepack`), il est utilisé
+   directement (l'ancien dossier `./ressourcepack` — faute de frappe — est aussi accepté).
+3. Sans pack et sans réseau, un atlas **procédural** (couleurs + bruit par bloc) est généré —
+   le client fonctionne sans aucun asset.
 
-Pour utiliser les textures vanilla : extrais le jar (`unzip client.jar assets/` — les
+**Résolution des textures vanilla (V1.0.2)** : les textures sont résolues via le vrai pipeline
+Minecraft — `blockstates/*.json` → `models/block/*.json` → textures (avec héritage des
+modèles parents, références `#texture`, et le nouveau format 1.21.2+ `{"sprite": ...}`).
+Résultat : ~93 % des blocs ont leur vraie texture au lieu de ~50 % avant.
+
+**HUD texturé (V1.0.2)** : les cœurs et la barre de faim utilisent les sprites vanilla du pack
+(`/hud.png` + `/hud.json`), avec support des demi-cœurs. Fallback emoji si le pack est absent.
+
+Pour utiliser les textures vanilla manuellement : extrais le jar (`unzip client.jar assets/` — les
 textures Mojang ne sont pas redistribuables, fais-le localement) et place le dossier
 `assets/...` dans `./resourcepack/`.
 

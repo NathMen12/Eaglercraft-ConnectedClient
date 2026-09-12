@@ -102,6 +102,9 @@ class Renderer {
     this.localPitch = null
     this.serverYaw = undefined   // last server look echo (used when not locked)
     this.serverPitch = undefined
+    this.sneaking = false   // eye height dips to 1.27 while sneaking
+    this.sprinting = false  // FOV widens to 77° while sprinting
+    this.eyeHeight = 1.62   // smoothed current eye height
   }
 
   async init (loginMsg) {
@@ -543,6 +546,14 @@ class Renderer {
     this.localPitch = pitch
   }
 
+  /** Sneak state toggles the eye height (1.62 standing, 1.27 sneaking,
+   *  like vanilla) — smoothed per frame so the camera dips instead of
+   *  teleporting when the key is pressed/released. Sprint widens the FOV. */
+  setSneakSprint (sneaking, sprinting) {
+    this.sneaking = !!sneaking
+    this.sprinting = !!sprinting
+  }
+
   /**
    * Applies the camera transform EVERY FRAME:
    *  - rotation from the LOCAL mouse look (instant, no network round-trip)
@@ -572,7 +583,18 @@ class Renderer {
       this.camPos.x += (this.camTarget.x - this.camPos.x) * alpha
       this.camPos.y += (this.camTarget.y - this.camPos.y) * alpha
       this.camPos.z += (this.camTarget.z - this.camPos.z) * alpha
-      cam.position.set(this.camPos.x, this.camPos.y + 1.62, this.camPos.z)
+      // Eye height: 1.62 standing / 1.27 sneaking (vanilla), smoothed with
+      // the same time constant so the camera DIPS when sneaking instead of
+      // teleporting. When sprinting, the FOV widens slightly like vanilla.
+      const targetEye = this.sneaking ? 1.27 : 1.62
+      this.eyeHeight += (targetEye - this.eyeHeight) * alpha
+      cam.position.set(this.camPos.x, this.camPos.y + this.eyeHeight, this.camPos.z)
+      // Sprint FOV effect (vanilla: +10% while sprinting)
+      const targetFov = this.sprinting ? 77 : 70
+      if (Math.abs(cam.fov - targetFov) > 0.05) {
+        cam.fov += (targetFov - cam.fov) * alpha
+        cam.updateProjectionMatrix()
+      }
     }
   }
 

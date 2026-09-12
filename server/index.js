@@ -39,13 +39,79 @@ app.get('/node_modules/three/build/:file', (req, res) => {
   res.sendFile(path.join(THREE_BUILD, file))
 })
 
-// Build the texture atlas once at startup (pack if present, procedural else)
-const atlasResult = resourcePack.buildResourcePack(config.resourcePackPath, '1.21.9') ||
-  resourcePack.buildProceduralAtlas('1.21.9')
-app.get('/atlas.png', (req, res) => {
+// Build the texture atlas once at startup (pack if present, procedural else).
+// When no pack exists on disk, try to auto-download it first (V1.0.2) so a
+// fresh clone gets the real Minecraft textures on first boot.
+let atlasResult = null
+const bootPromise = (async () => {
+  if (!config.resourcePackPath) {
+    const downloaded = await resourcePack.ensureResourcePack(path.join(__dirname, '..', 'resourcepack'))
+    if (downloaded) config.resourcePackPath = downloaded
+  }
+  atlasResult = resourcePack.buildResourcePack(config.resourcePackPath, '1.21.9') ||
+    resourcePack.buildProceduralAtlas('1.21.9')
+  return atlasResult
+})()
+
+app.get('/atlas.png', async (req, res) => {
+  await bootPromise
   res.set('Content-Type', 'image/png')
   res.set('Cache-Control', 'public, max-age=86400')
   res.send(atlasResult.atlasPng)
+})
+
+// HUD spritesheet (hearts/food from the pack's GUI sprites, drawn-emoji
+// fallback in CSS when absent). Built during the async boot with the atlas.
+let hudSheet = null
+// Biome colormaps (grass/foliage) + item atlas — built during boot too.
+let colormaps = null
+let itemAtlas = null
+bootPromise.then(() => {
+  if (!config.resourcePackPath) return
+  try {
+    const assetsDir = resourcePack.findAssetsDir(config.resourcePackPath)
+    if (!assetsDir) return
+    hudSheet = resourcePack.buildHudSheet(assetsDir)
+    if (hudSheet) console.log(`[resourcePack] HUD sheet built (${Object.keys(hudSheet.sprites).filter(k => hudSheet.sprites[k]).length}/6 sprites)`)
+    colormaps = resourcePack.buildColormaps(assetsDir)
+    if (colormaps) console.log('[resourcePack] biome colormaps loaded (grass + foliage)')
+    itemAtlas = resourcePack.buildItemAtlas(assetsDir, '1.21.9')
+  } catch (e) {
+    console.warn('[resourcePack] HUD sheet build failed:', e.message)
+  }
+})
+
+app.get('/hud.png', (req, res) => {
+  if (!hudSheet) { res.status(404).end(); return }
+  res.set('Content-Type', 'image/png')
+  res.set('Cache-Control', 'public, max-age=86400')
+  res.send(hudSheet.png)
+})
+app.get('/hud.json', (req, res) => {
+  res.set('Content-Type', 'application/json')
+  res.set('Cache-Control', 'public, max-age=86400')
+  if (!hudSheet) { res.json({}); return }
+  res.json({
+    sheetWidth: hudSheet.sheetWidth,
+    sheetHeight: hudSheet.sheetHeight,
+    sprites: hudSheet.sprites
+  })
+})
+
+// Item atlas (hotbar/inventory icons) — 404 when the pack has no items.
+app.get('/items.png', (req, res) => {
+  if (!itemAtlas) { res.status(404).end(); return }
+  res.set('Content-Type', 'image/png')
+  res.set('Cache-Control', 'public, max-age=86400')
+  res.send(itemAtlas.atlasPng)
+})
+app.get('/items.json', (req, res) => {
+  res.set('Content-Type', 'application/json')
+  res.set('Cache-Control', 'public, max-age=86400')
+  if (!itemAtlas) { res.json({}); return }
+  const out = {}
+  for (const [name, m] of itemAtlas.mappings) out[name] = m.tile
+  res.json({ atlasGrid: 64, tileSize: 16, items: out })
 })
 
 // blockId -> blockName table for the client renderer. Built lazily per
@@ -119,6 +185,21 @@ wss.on('connection', (ws) => {
       case 'disconnect_bot':
         manager.handleSocketClose(ws.id)
         sendJson(ws, { t: 'bot_closed' })
+        break
+      case 'reset_chunks':
+        // Client asked for a full chunk reload (R key): the streaming state
+        // (sent set + queue) is wiped and everything re-scanned from zero —
+        // fixes client-side phantom blocks after desyncs.
+        handleResetChunks(ws)
+        break
+      case 'dig':
+        handleDig(ws, msg)
+        break
+      case 'place':
+        handlePlace(ws, msg)
+        break
+      case 'activate':
+        handleActivate(ws, msg)
         break
       default:
         break
@@ -201,7 +282,10 @@ function handleLook (ws, msg) {
   // force=true applies the look immediately (skips the smooth transition
   // task) — the client is the only one driving the camera, so no smoothing
   // is needed and small mouse deltas are never lost.
-  try { session.bot.look(clampedYaw, clampedPitch, true) } catch (e) {}
+  // Pitch INVERSION: the web client uses "positive = down" but mineflayer
+  // uses "positive = up" (conversions.js: toNotchianPitch = -pitch) —
+  // without the negation the bot looked UP when the player looked down.
+  try { session.bot.look(clampedYaw, -clampedPitch, true) } catch (e) {}
 }
 
 function handleChat (ws, msg) {
@@ -210,6 +294,97 @@ function handleChat (ws, msg) {
   const text = String(msg.text || '').slice(0, 256)
   if (!text) return
   try { session.bot.chat(text) } catch (e) {}
+}
+
+// ---------------------------------------------------------------------------
+// World interaction (dig / place / activate) + chunk reset — V1.1.0
+// ---------------------------------------------------------------------------
+
+/** Validates block coordinates coming from the client. */
+function validBlockCoords (msg) {
+  const x = Math.floor(Number(msg.x))
+  const y = Math.floor(Number(msg.y))
+  const z = Math.floor(Number(msg.z))
+  if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return null
+  return { x, y, z }
+}
+
+/** R key: full chunk reload on both sides (fixes phantom blocks). */
+function handleResetChunks (ws) {
+  const session = manager.sessions.get(ws.id)
+  if (!session) return
+  if (session.stream && typeof session.stream.reset === 'function') {
+    session.stream.reset()
+    sendJson(ws, { t: 'chunks_reset' })
+  }
+}
+
+/** Left click: mine the block at (x,y,z). Uses the bot's reach safety. */
+function handleDig (ws, msg) {
+  const session = manager.sessions.get(ws.id)
+  if (!session || !session.bot) return
+  const bot = session.bot
+  const pos = validBlockCoords(msg)
+  if (!pos) return
+  const { Vec3 } = require('vec3')
+  const block = bot.blockAt(new Vec3(pos.x, pos.y, pos.z))
+  if (!block || block.name === 'air') {
+    sendJson(ws, { t: 'dig_error', error: 'Block not found / out of reach' })
+    return
+  }
+  bot.lookAt(new Vec3(pos.x + 0.5, pos.y + 0.5, pos.z + 0.5), true).then(() => {
+    return bot.dig(block, true)
+  }).then(() => {
+    sendJson(ws, { t: 'dig_ok' })
+    // Attach/dig already streams the block_update via the world listener
+  }).catch((e) => {
+    sendJson(ws, { t: 'dig_error', error: e.message || 'dig failed' })
+  })
+}
+
+/** Right click: place the held block against the (x,y,z)+face. */
+function handlePlace (ws, msg) {
+  const session = manager.sessions.get(ws.id)
+  if (!session || !session.bot) return
+  const bot = session.bot
+  const pos = validBlockCoords(msg)
+  if (!pos) return
+  const face = Math.floor(Number(msg.face))
+  if (!(face >= 0 && face <= 5)) return
+  const held = bot.heldItem
+  if (!held) {
+    sendJson(ws, { t: 'place_error', error: 'Nothing in hand' })
+    return
+  }
+  const { Vec3 } = require('vec3')
+  const FACE_VECS = [
+    new Vec3(1, 0, 0), new Vec3(-1, 0, 0),
+    new Vec3(0, 1, 0), new Vec3(0, -1, 0),
+    new Vec3(0, 0, 1), new Vec3(0, 0, -1)
+  ]
+  const referenceBlock = bot.blockAt(new Vec3(pos.x, pos.y, pos.z))
+  if (!referenceBlock || referenceBlock.name === 'air') {
+    sendJson(ws, { t: 'place_error', error: 'Reference block missing' })
+    return
+  }
+  const faceVec = FACE_VECS[face]
+  bot.lookAt(new Vec3(pos.x + 0.5 + faceVec.x * 0.5, pos.y + 0.5 + faceVec.y * 0.5, pos.z + 0.5 + faceVec.z * 0.5), true)
+    .then(() => bot.placeBlock(referenceBlock, faceVec))
+    .then(() => sendJson(ws, { t: 'place_ok' }))
+    .catch((e) => sendJson(ws, { t: 'place_error', error: e.message || 'place failed' }))
+}
+
+/** Activate the held item (right click on air / use: eat, shoot, etc.). */
+function handleActivate (ws, msg) {
+  const session = manager.sessions.get(ws.id)
+  if (!session || !session.bot) return
+  const bot = session.bot
+  try {
+    bot.activateItem()
+    sendJson(ws, { t: 'activate_ok' })
+  } catch (e) {
+    sendJson(ws, { t: 'activate_error', error: e.message || 'activate failed' })
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -234,13 +409,18 @@ manager.on('queuePromoted', (socket) => {
   sendJson(socket, { t: 'queue_promoted' })
 })
 
-manager.on('botReady', (socket, session, mcData) => {
+manager.on('botReady', async (socket, session, mcData) => {
+  // A bot login can theoretically race with the first-boot atlas build
+  // (pack auto-download): wait for it before sending the mappings.
+  await bootPromise
   const bot = session.bot
   session.streamer = new WorldStreamer({
     bot,
     mcData,
     renderDistance: config.renderDistance
   })
+  // Vanilla biome colormaps -> the streamer tints grass/leaves/water
+  session.streamer.colormaps = colormaps
 
   sendJson(socket, {
     t: 'login',
@@ -249,7 +429,7 @@ manager.on('botReady', (socket, session, mcData) => {
     host: session.request.host,
     port: session.request.port,
     // Texture mappings for the client renderer (block name -> atlas tiles)
-    blockMappings: atlasBlockMappings,
+    blockMappings: atlasBlockMappings(),
     minY: bot.game ? bot.game.minY : 0,
     worldHeight: bot.game ? (bot.game.height || 256) : 256,
     renderDistance: config.renderDistance,
@@ -261,16 +441,20 @@ manager.on('botReady', (socket, session, mcData) => {
 })
 
 /** blockName -> { top, bottom, side, cross?, opacity? } as a plain object.
- *  Built once at startup (the atlas is static for the server's lifetime). */
-const atlasBlockMappings = (() => {
+ *  Built lazily AFTER the async boot (pack download + atlas build) — the
+ *  login handler can't race with it because a bot login takes seconds. */
+let _atlasBlockMappingsCache = null
+function atlasBlockMappings () {
+  if (_atlasBlockMappingsCache) return _atlasBlockMappingsCache
   const out = {}
   for (const [name, m] of atlasResult.mappings) {
     out[name] = { top: m.top, bottom: m.bottom, side: m.side }
     if (m.cross) out[name].cross = 1
     if (m.opacity !== undefined) out[name].opacity = m.opacity
   }
+  _atlasBlockMappingsCache = out
   return out
-})()
+}
 
 /** Entity type name -> { height, width } for client-side box sizing. */
 const entityMappingsCache = new Map() // version -> object
@@ -340,6 +524,21 @@ function attachWorldStreaming (socket, session, mcData) {
   // (The initial world load races with the login event.)
   for (const c of bot.world.getColumns()) {
     queueChunk(Number(c.chunkX), Number(c.chunkZ))
+  }
+
+  // Full reset (R key on the client): forget every sent/queued chunk and
+  // re-queue the whole render distance from zero. The client wipes its
+  // meshes at the same time, so the world is rebuilt consistently on both
+  // sides — this is the fix for client-side "phantom blocks" desyncs.
+  session.stream = {
+    reset () {
+      sentChunks.clear()
+      queuedChunks.clear()
+      chunkQueue.length = 0
+      lastCenter = { cx: null, cz: null }
+      updateCenter()
+    },
+    queueChunk
   }
 
   // Drain loop: respects the socket's backpressure and a per-tick CPU budget.
@@ -457,7 +656,10 @@ function attachBotEvents (socket, session) {
     const payload = {
       t: 'position',
       x: e.position.x, y: e.position.y, z: e.position.z,
-      yaw: e.yaw, pitch: e.pitch,
+      yaw: e.yaw,
+      // Convert mineflayer's pitch convention (positive = UP) to the web
+      // client's (positive = down) — see handleLook for the mirror inversion.
+      pitch: -e.pitch,
       onGround: !!e.onGround
     }
     // health/food are only defined once the server sent update_health

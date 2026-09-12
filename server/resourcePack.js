@@ -265,12 +265,168 @@ class AtlasBuilder {
 }
 
 // ---------------------------------------------------------------------------
-// Vanilla pack loading
+// Vanilla texture resolution (blockstate -> model -> texture)
 // ---------------------------------------------------------------------------
 
 /**
+ * Vanilla texture resolver: reads the pack's blockstates/<block>.json to
+ * find the model, then the model's JSON to find the texture references
+ * (`all`, `top`, `side`, `bottom`, `end`, `cross`, `plant`, `pane`, ...).
+ * This replaces the old filename heuristics — the pack defines 1200+ block
+ * models and guessing file names left 618/1199 tiles procedural (the
+ * "noisy blocks" bug).
+ *
+ * Returns { top, bottom, side } RELATIVE texture paths (no leading
+ * 'textures/', no '.png'), or null when the pack has no data for the block.
+ */
+class VanillaTextureResolver {
+  constructor (assetsDir) {
+    this.assetsDir = assetsDir
+    this.blockstates = new Map() // block name -> parsed blockstate JSON
+    this.models = new Map()      // model path -> parsed model JSON
+    this.textureCache = new Map() // block name -> { top, bottom, side } | null
+  }
+
+  /** blockName -> { top, bottom, side } (RELATIVE paths), or null. */
+  resolve (blockName) {
+    if (this.textureCache.has(blockName)) return this.textureCache.get(blockName)
+    const result = this._resolve(blockName)
+    this.textureCache.set(blockName, result)
+    return result
+  }
+
+  _resolve (blockName) {
+    try {
+      const stateJson = this._loadBlockstate(blockName)
+      if (!stateJson) return null
+      // Pick the first variant/first multipart entry — good enough for a
+      // renderer that only shows one texture per face kind.
+      let modelPath = null
+      if (stateJson.variants) {
+        const firstKey = Object.keys(stateJson.variants)[0]
+        const variant = stateJson.variants[firstKey]
+        modelPath = Array.isArray(variant) ? variant[0]?.model : variant?.model
+      } else if (stateJson.multipart) {
+        const apply = stateJson.multipart[0]?.apply
+        modelPath = Array.isArray(apply) ? apply[0]?.model : apply?.model
+      }
+      if (!modelPath) return null
+      const modelJson = this._loadModel(modelPath)
+      if (!modelJson) return null
+      return this._texturesFromModel(modelJson)
+    } catch (e) {
+      return null
+    }
+  }
+
+  /** Loads blockstates/<name>.json (cached). */
+  _loadBlockstate (blockName) {
+    if (this.blockstates.has(blockName)) return this.blockstates.get(blockName)
+    let json = null
+    try {
+      const p = path.join(this.assetsDir, 'minecraft', 'blockstates', `${blockName}.json`)
+      if (fs.existsSync(p)) json = JSON.parse(fs.readFileSync(p, 'utf8'))
+    } catch (e) { json = null }
+    this.blockstates.set(blockName, json)
+    return json
+  }
+
+  /** Loads models/block/<path>.json (cached, handles nested parents). */
+  _loadModel (modelPath) {
+    if (this.models.has(modelPath)) return this.models.get(modelPath)
+    let json = null
+    try {
+      const rel = String(modelPath).replace(/^minecraft:/, '').replace(/^block\//, '')
+      const p = path.join(this.assetsDir, 'minecraft', 'models', 'block', rel + (rel.endsWith('.json') ? '' : '.json'))
+      if (fs.existsSync(p)) json = JSON.parse(fs.readFileSync(p, 'utf8'))
+    } catch (e) { json = null }
+    this.models.set(modelPath, json)
+    return json
+  }
+
+  /**
+   * Extracts { top, bottom, side } from a model JSON, walking the parent
+   * chain (cube_bottom_top, cube_column, cross, fence_post...) and MERGING
+   * the textures maps (child overrides parent — vanilla semantics).
+   * Handles '#' references (e.g. fence models use "texture": "#texture").
+   */
+  _texturesFromModel (modelJson, depth = 0, inheritedTextures = null) {
+    if (!modelJson || depth > 10) return null
+    // Vanilla semantics: the child's textures override the parent's on the
+    // same keys; parents contribute the rest (e.g. fence_post + planks).
+    const textures = Object.assign({}, inheritedTextures, modelJson.textures)
+    // Handles BOTH texture formats:
+    //   - classic:  "side": "minecraft:block/oak_planks"
+    //   - 1.21.2+:  "side": { "sprite": "minecraft:block/oak_planks", "force_translucent": true }
+    const deref = (v, seen = 0) => {
+      if (v == null || seen > 4) return null
+      if (typeof v === 'object') v = v.sprite // modern format
+      if (typeof v !== 'string' || !v) return null
+      if (v.startsWith('#')) return deref(textures[v.slice(1)], seen + 1)
+      return this._strip(v)
+    }
+    const pick = (...keys) => {
+      for (const k of keys) {
+        const v = deref(textures[k])
+        if (v) return v
+      }
+      return null
+    }
+    // Cross models (plants/fences/panes): everything uses one texture
+    if (textures.cross || textures.plant || textures.all || textures.texture) {
+      const s = pick('cross', 'plant', 'all', 'texture')
+      if (s) return { top: s, bottom: s, side: s }
+    }
+    const top = pick('top', 'up', 'end')
+    const bottom = pick('bottom', 'down', 'end')
+    const side = pick('side', 'north', 'all', 'texture', 'pane')
+    if (top || bottom || side) {
+      return { top: top || side, bottom: bottom || side, side: side || top }
+    }
+    // Element-based models (torch, rails, redstone wire...): the textures
+    // only appear as "#refs" inside elements[].faces[].texture. Collect them
+    // in face order (down/up/north/south/east/west) and deref.
+    if (Array.isArray(modelJson.elements)) {
+      const faceKeys = ['up', 'down', 'north', 'south', 'east', 'west']
+      const found = { top: null, bottom: null, side: null }
+      for (const el of modelJson.elements) {
+        if (!el || typeof el !== 'object' || !el.faces) continue
+        for (const fk of faceKeys) {
+          const face = el.faces[fk]
+          if (!face || !face.texture) continue
+          const resolved = deref(face.texture)
+          if (!resolved) continue
+          if (fk === 'up' && !found.top) found.top = resolved
+          else if (fk === 'down' && !found.bottom) found.bottom = resolved
+          else if (!found.side) found.side = resolved
+        }
+      }
+      if (found.top || found.bottom || found.side) {
+        return {
+          top: found.top || found.side,
+          bottom: found.bottom || found.side,
+          side: found.side || found.top || found.bottom
+        }
+      }
+    }
+    // Walk the parent model (cube_bottom_top etc.) with merged textures
+    if (modelJson.parent) {
+      return this._texturesFromModel(this._loadModel(modelJson.parent), depth + 1, textures)
+    }
+    return null
+  }
+
+  /** 'minecraft:block/dirt' -> 'block/dirt' (relative to textures/). */
+  _strip (ref) {
+    return String(ref).replace(/^minecraft:/, '').replace(/^textures\//, '')
+  }
+}
+
+/**
  * Maps a block name to its vanilla texture filenames (relative to
- * assets/minecraft/). Most blocks: `<name>.png` (+ `_top` for logs/pillars).
+ * assets/minecraft/). Fallback heuristic when the pack has no
+ * blockstate/model JSON for the block — the primary resolution now goes
+ * through the pack's own blockstates and models (see VanillaTextureResolver).
  */
 function textureFilesFor (blockName) {
   const t = (n) => `textures/block/${n}.png`
@@ -373,22 +529,32 @@ function buildResourcePack (packPath, version) {
   if (!assetsDir) return null
 
   const builder = new AtlasBuilder()
-  const stats = { loaded: 0, fallback: 0 }
+  const stats = { loaded: 0, fallback: 0, resolved: 0 }
+  const resolver = new VanillaTextureResolver(assetsDir)
 
   for (const block of mcData.blocksArray) {
     const name = block.name
     if (name === 'air' || name === 'cave_air' || name === 'void_air' || name === 'moving_piston') continue
-    const files = textureFilesFor(name)
+    // 1) Vanilla pipeline: blockstate -> model -> texture paths
+    const resolved = resolver.resolve(name)
+    const files = resolved
+      ? {
+          side: `textures/${resolved.side}.png`,
+          top: `textures/${resolved.top}.png`,
+          bottom: `textures/${resolved.bottom}.png`
+        }
+      : textureFilesFor(name) // 2) heuristic fallback (no blockstate/model)
     const side = tileFor(builder, assetsDir, files.side, name, stats)
     const top = tileFor(builder, assetsDir, files.top, name, stats)
     const bottom = tileFor(builder, assetsDir, files.bottom, name, stats)
+    if (resolved) stats.resolved++
     const mapping = { top, bottom, side }
     if (CROSS_BLOCKS.has(name)) mapping.cross = true
     if (TRANSPARENT_BLOCKS.has(name)) mapping.opacity = 0.5
     builder.mappings.set(name, mapping)
   }
 
-  console.log(`[resourcePack] atlas built: ${stats.loaded} tiles from pack, ${stats.fallback} procedural, ${builder.nextTile} total`)
+  console.log(`[resourcePack] atlas built: ${stats.loaded} tiles from pack (${stats.resolved} resolved via blockstates/models), ${stats.fallback} procedural, ${builder.nextTile} total`)
   return builder.result()
 }
 
@@ -409,9 +575,163 @@ function buildProceduralAtlas (version) {
   return builder.result()
 }
 
+/**
+ * Builds the HUD spritesheet from the pack's GUI sprites (hearts, food):
+ * a vertical strip of 9x9 tiles. Returns { png, sprites } or null when the
+ * pack has no HUD sprites.
+ *
+ * Sprite order (fixed): heartContainer, heartFull, heartHalf,
+ * foodEmpty, foodFull, foodHalf — indices in `sprites` are tile numbers
+ * (top-to-bottom, one per 9px row band).
+ */
+const HUD_SPRITES = [
+  ['heart_container', 'textures/gui/sprites/hud/heart/container.png'],
+  ['heart_full', 'textures/gui/sprites/hud/heart/full.png'],
+  ['heart_half', 'textures/gui/sprites/hud/heart/half.png'],
+  ['food_empty', 'textures/gui/sprites/hud/food_empty.png'],
+  ['food_full', 'textures/gui/sprites/hud/food_full.png'],
+  ['food_half', 'textures/gui/sprites/hud/food_half.png']
+]
+
+function buildHudSheet (assetsDir) {
+  const tiles = []
+  let width = 0
+  let height = 0
+  for (const [key, rel] of HUD_SPRITES) {
+    const p = path.join(assetsDir, 'minecraft', rel)
+    if (!fs.existsSync(p)) { tiles.push(null); continue }
+    try {
+      const img = PNG.sync.read(fs.readFileSync(p))
+      tiles.push(img)
+      width = Math.max(width, img.width)
+      height += img.height
+    } catch (e) {
+      tiles.push(null)
+    }
+  }
+  if (tiles.every((t) => t === null)) return null
+  // Compose the sheet (nulls are skipped rows but keep their index)
+  const sheet = new PNG({ width: Math.max(width, 9), height: Math.max(height, 9) })
+  const sprites = {}
+  let y = 0
+  let i = 0
+  for (const img of tiles) {
+    const key = HUD_SPRITES[i][0]
+    if (img) {
+      PNG.bitblt(img, sheet, 0, 0, img.width, img.height, 0, y)
+      sprites[key] = { x: 0, y, w: img.width, h: img.height }
+      y += img.height
+    } else {
+      sprites[key] = null
+    }
+    i++
+  }
+  return { png: PNG.sync.write(sheet), sprites, sheetWidth: sheet.width, sheetHeight: sheet.height }
+}
+
+// ---------------------------------------------------------------------------
+// Resource pack auto-download
+// ---------------------------------------------------------------------------
+
+/**
+ * Downloads a resource pack ZIP from `url` and extracts the parts we need
+ * (blockstates, models, block textures, HUD sprites) into `destDir`.
+ * Skips the download when `destDir` already contains assets. Returns the
+ * pack directory path, or null on failure (the caller falls back to the
+ * procedural atlas).
+ *
+ * Node 18+ only (global fetch + stream/promises pipeline).
+ */
+const DEFAULT_PACK_URL = process.env.RESOURCE_PACK_URL || 'https://www.dropbox.com/scl/fi/awz1u7z2oorsp15j30bnw/26.2.x-Template.zip?rlkey=a3tz81fe4uij1wjtj2imco8hs&st=6xg261xt&dl=1'
+
+async function ensureResourcePack (destDir, url = DEFAULT_PACK_URL) {
+  const marker = path.join(destDir, 'assets', 'minecraft')
+  if (fs.existsSync(marker)) return destDir // already installed
+  try {
+    fs.mkdirSync(destDir, { recursive: true })
+    const res = await fetch(url, { redirect: 'follow' })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const zipPath = path.join(destDir, '_pack.zip')
+    const buf = Buffer.from(await res.arrayBuffer())
+    fs.writeFileSync(zipPath, buf)
+    // Extract only what the atlas/HUD builder reads
+    const entries = [
+      'assets/minecraft/blockstates/*',
+      'assets/minecraft/models/block/*',
+      'assets/minecraft/textures/block/*',
+      'assets/minecraft/textures/gui/sprites/hud/*'
+    ]
+    const { execFile } = require('child_process')
+    await new Promise((resolve, reject) => {
+      execFile('unzip', ['-q', '-o', zipPath, ...entries, '-d', destDir], (err) => err ? reject(err) : resolve())
+    })
+    fs.rmSync(zipPath, { force: true })
+    if (!fs.existsSync(marker)) throw new Error('pack layout not recognized (missing assets/minecraft)')
+    console.log(`[resourcePack] downloaded & extracted (${(buf.length / 1e6).toFixed(1)} MB) -> ${destDir}`)
+    return destDir
+  } catch (e) {
+    console.warn(`[resourcePack] auto-download failed: ${e.message} — falling back to procedural textures`)
+    return null
+  }
+}
+
+/**
+ * Loads the vanilla biome colormaps (grass.png / foliage.png) from the
+ * pack. Returns { grass: PNG, foliage: PNG } or null when absent.
+ */
+function buildColormaps (assetsDir) {
+  try {
+    const grassPath = path.join(assetsDir, 'minecraft', 'textures', 'colormap', 'grass.png')
+    const foliagePath = path.join(assetsDir, 'minecraft', 'textures', 'colormap', 'foliage.png')
+    if (!fs.existsSync(grassPath) || !fs.existsSync(foliagePath)) return null
+    return {
+      grass: PNG.sync.read(fs.readFileSync(grassPath)),
+      foliage: PNG.sync.read(fs.readFileSync(foliagePath))
+    }
+  } catch (e) {
+    return null
+  }
+}
+
+/**
+ * Builds the ITEM texture atlas (16x16 tiles) from the pack's
+ * textures/item/*.png, for every item in the registry. Returns
+ * { atlasPng, mappings } (item name -> tile index) or null without a pack.
+ * Reuses AtlasBuilder (same 64x64 grid as the block atlas).
+ */
+function buildItemAtlas (assetsDir, version) {
+  try {
+    const mcData = minecraftData(version === undefined ? '1.21.9' : version)
+    if (!mcData || !fs.existsSync(path.join(assetsDir, 'minecraft', 'textures', 'item'))) return null
+    const builder = new AtlasBuilder()
+    let loaded = 0
+    for (const item of mcData.itemsArray) {
+      const p = path.join(assetsDir, 'minecraft', 'textures', 'item', `${item.name}.png`)
+      if (!fs.existsSync(p)) continue
+      try {
+        const tile = builder.addTileFromBuffer(fs.readFileSync(p))
+        builder.mappings.set(item.name, { tile })
+        loaded++
+      } catch (e) { /* skip broken item png */ }
+    }
+    if (loaded === 0) return null
+    console.log(`[resourcePack] item atlas built: ${loaded} items`)
+    return builder.result()
+  } catch (e) {
+    console.warn('[resourcePack] item atlas failed:', e.message)
+    return null
+  }
+}
+
 module.exports = {
   buildResourcePack,
   buildProceduralAtlas,
+  buildHudSheet,
+  buildColormaps,
+  buildItemAtlas,
+  ensureResourcePack,
+  findAssetsDir,
+  VanillaTextureResolver,
   PROCEDURAL_COLORS,
   CROSS_BLOCKS,
   TRANSPARENT_BLOCKS

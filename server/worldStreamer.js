@@ -10,14 +10,15 @@
  * visible faces so the client only builds the geometry it needs.
  *
  * Binary chunk format (little-endian, then zlib-deflated):
- *   u8  version = 1
+ *   u8  version = 2
  *   i32 chunkX, i32 chunkZ, i32 minY
  *   u16 blockCount
  *   blockCount * entry:
  *     u8 localX, u16 localY (block index in column), u8 localZ
  *     u16 blockId
  *     u8  faceMask (bit0..5 = +X,-X,+Y,-Y,+Z,-Z)
- *   One entry costs 7 bytes before compression.
+ *     u16 tint (packed RGB565 — 0 when the block is NOT biome-tinted)
+ *   One entry costs 9 bytes before compression.
  */
 
 const zlib = require('zlib')
@@ -45,6 +46,11 @@ const NPOS = { x: 0, y: 0, z: 0 }
 function POS_SET (x, y, z) {
   POS.x = x; POS.y = y; POS.z = z
   return POS
+}
+
+/** Packs 8-bit RGB into RGB565 (the on-wire tint format). */
+function pack565 (r, g, b) {
+  return ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
 }
 
 /**
@@ -174,15 +180,20 @@ class WorldStreamer {
     // transparent block). One flat typed-array read per neighbour instead
     // of two Set lookups — this table is read millions of times per chunk.
     this._exposedByState = new Uint8Array(0)
+    // stateId -> tint KIND: 0 none, 1 grass, 2 foliage, 3 water
+    this._stateToTint = new Uint8Array(0)
     this._buildStateLookup()
     // Reusable growable encode buffer (avoids a big alloc per chunk)
     this._encodeBuf = null
     // Pool of section scratch buffers (Uint32Array[4096]) reused across
     // chunks — flattening 9 sections used to allocate ~144 KB per chunk.
     this._flatPool = []
+    // Biome id -> [grassRGB565, foliageRGB565, waterRGB565] — built lazily
+    // from the vanilla colormaps (see _buildBiomeTints).
+    this._biomeTints = new Map()
   }
 
-  /** Precomputes stateId -> blockId / skip / exposed tables once per streamer. */
+  /** Precomputes stateId -> blockId / skip / exposed / tint tables. */
   _buildStateLookup () {
     const byState = this.mcData.blocksByStateId
     if (!Array.isArray(byState) || byState.length === 0) return
@@ -190,6 +201,10 @@ class WorldStreamer {
     const ids = new Int32Array(n) // 0 = air/not present
     const skipped = new Uint8Array(n)
     const exposed = new Uint8Array(n)
+    const tint = new Uint8Array(n) // 0 none, 1 grass, 2 foliage, 3 water
+    // Blocks whose grayscale texture is multiplied by the biome color
+    const GRASS_TINTED = new Set(['grass_block', 'short_grass', 'tall_grass', 'fern', 'large_fern', 'grass', 'sugar_cane', 'vines', 'vine', 'lily_pad'])
+    const FOLIAGE_TINTED = new Set(['oak_leaves', 'spruce_leaves', 'birch_leaves', 'jungle_leaves', 'acacia_leaves', 'dark_oak_leaves', 'mangrove_leaves', 'cherry_leaves', 'azalea_leaves', 'flowering_azalea_leaves', 'pale_oak_leaves'])
     for (let stateId = 0; stateId < n; stateId++) {
       const info = byState[stateId]
       if (!info) continue
@@ -198,10 +213,54 @@ class WorldStreamer {
       // A neighbour face is visible when the neighbour is air-like
       // (transparent) or an empty bounding box (torch, grass...)
       exposed[stateId] = (info.transparent || info.boundingBox === 'empty' || this.skippedBlocks.has(info.id)) ? 1 : 0
+      if (GRASS_TINTED.has(info.name)) tint[stateId] = 1
+      else if (FOLIAGE_TINTED.has(info.name)) tint[stateId] = 2
+      else if (info.name === 'water') tint[stateId] = 3
     }
     this._stateToId = ids
     this._stateToSkipped = skipped
     this._exposedByState = exposed
+    this._stateToTint = tint
+  }
+
+  /**
+   * Samples the vanilla colormap (grass.png / foliage.png) at the biome's
+   * (temperature, downfall) coordinates — exactly what the vanilla client
+   * does. Returns the packed RGB565 color. `this.colormaps` is set at boot
+   * ({ grass: PNG, foliage: PNG } or null when the pack has none).
+   */
+  _colormapSample (kind, temperature, downfall) {
+    const map = this.colormaps && (kind === 2 ? this.colormaps.foliage : this.colormaps.grass)
+    if (!map) return 0
+    const t = Math.max(0, Math.min(1, temperature))
+    const d = Math.max(0, Math.min(1, downfall))
+    const x = Math.min(map.width - 1, Math.floor((1 - t) * (map.width - 1)))
+    const y = Math.min(map.height - 1, Math.floor((1 - d) * (map.height - 1)))
+    const idx = (y * map.width + x) * 4
+    const r = map.data[idx]; const g = map.data[idx + 1]; const b = map.data[idx + 2]
+    return ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
+  }
+
+  /**
+   * Builds (and caches per biome) the 3 tint colors from the vanilla
+   * colormaps. Water uses vanilla's fixed blue (per-biome water would need
+   * extra data; 0x3F76E4 matches the vanilla overworld average).
+   */
+  _biomeTintFor (biomeId) {
+    let tints = this._biomeTints.get(biomeId)
+    if (tints) return tints
+    const biome = (this.mcData.biomesArray || []).find((b) => b.id === biomeId)
+    if (!biome) {
+      tints = [0, 0, pack565(63, 118, 228)]
+    } else {
+      tints = [
+        this._colormapSample(1, biome.temperature, biome.downfall ?? 0.5),
+        this._colormapSample(2, biome.temperature, biome.downfall ?? 0.5),
+        pack565(63, 118, 228)
+      ]
+    }
+    this._biomeTints.set(biomeId, tints)
+    return tints
   }
 
   /** Maps a state id to the block info object (cached), or null. */
@@ -301,7 +360,7 @@ class WorldStreamer {
         flats[i] = out
       }
       if (allReadable) {
-        return this._scanColumnFast(chunkX, chunkZ, minY, maxY, sectionBase, sectionCount, flats)
+        return this._scanColumnFast(chunkX, chunkZ, minY, maxY, sectionBase, sectionCount, flats, column)
       }
     }
 
@@ -310,10 +369,12 @@ class WorldStreamer {
   }
 
   /** Fast column scan: iterates every non-empty flattened section. */
-  _scanColumnFast (chunkX, chunkZ, minY, maxY, sectionBase, sectionCount, flats) {
+  _scanColumnFast (chunkX, chunkZ, minY, maxY, sectionBase, sectionCount, flats, column) {
     const entries = []
     const ids = this._stateToId
+    const tints = this._stateToTint
     const hasFastTable = ids.length > 0
+    const anyTint = tints.length > 0 && this.colormaps
     for (let si = 0; si < sectionCount - sectionBase; si++) {
       const flat = flats[si]
       if (!flat) continue // null / empty section
@@ -335,7 +396,20 @@ class WorldStreamer {
             if (hasFastTable && stateId < ids.length && this._stateToSkipped[stateId]) continue
             const faceMask = this._computeFaceMaskFast(flats, si, x, yLocal, z, worldYBase, y, minY, maxY)
             if (faceMask === 0) continue
-            entries.push({ x, y: y - minY, z, blockId, faceMask })
+            // Biome tint (grass/leaves/water): sampled ONLY for tinted
+            // blocks — the biome read is the only extra cost and tinted
+            // blocks are a small minority of a column.
+            let tint = 0
+            if (anyTint && stateId < tints.length && tints[stateId] !== 0) {
+              const kind = tints[stateId]
+              if (typeof column.getBiome === 'function') {
+                POS.x = x; POS.y = y; POS.z = z
+                let biomeId = 0
+                try { biomeId = column.getBiome(POS) } catch (e) { biomeId = 0 }
+                tint = this._biomeTintFor(biomeId)[kind - 1] || 0
+              }
+            }
+            entries.push({ x, y: y - minY, z, blockId, faceMask, tint })
           }
         }
       }
@@ -429,18 +503,20 @@ class WorldStreamer {
    * Buffer (only the deflate output is fresh) to avoid a large allocation
    * per chunk. Level 1: near-instant compression, ~70% size reduction —
    * the old level 6 default burned CPU for ~5 extra percent.
+   * Format v2: 9 bytes/entry (v1 was 7) — the extra u16 packs the biome
+   * tint as RGB565 (0 = untinted).
    */
   encodeChunk (chunkX, chunkZ, minY, entries) {
     const count = entries.length
     const headerSize = 15 // v(1) + chunkX(4) + chunkZ(4) + minY(4) + count(2)
-    const size = headerSize + count * 7
+    const size = headerSize + count * 9
     if (!this._encodeBuf || this._encodeBuf.length < size) {
       // 25% slack so slightly bigger chunks don't trigger a realloc
       this._encodeBuf = Buffer.alloc(Math.ceil(size * 1.25))
     }
     const buf = this._encodeBuf
     let o = 0
-    buf.writeUInt8(1, o); o += 1
+    buf.writeUInt8(2, o); o += 1 // format version 2 (biome tint)
     buf.writeInt32LE(chunkX, o); o += 4
     buf.writeInt32LE(chunkZ, o); o += 4
     buf.writeInt32LE(minY, o); o += 4
@@ -451,6 +527,7 @@ class WorldStreamer {
       buf.writeUInt8(e.z, o); o += 1
       buf.writeUInt16LE(e.blockId, o); o += 2
       buf.writeUInt8(e.faceMask, o); o += 1
+      buf.writeUInt16LE(e.tint || 0, o); o += 2
     }
     // subarray view + deflateSync always returns a fresh Buffer — safe to send
     return zlib.deflateSync(buf.subarray(0, size), { level: 1 })
@@ -480,9 +557,21 @@ class WorldStreamer {
     }
     const blockId = this._blockIdForState(stateId)
     const faceMask = this.computeGlobalFaceMask(worldX, worldY, worldZ)
+    // Biome tint for the new block state (grass/leaves/water)
+    let tint = 0
+    if (blockId !== 0 && this.colormaps && stateId < this._stateToTint.length && this._stateToTint[stateId] !== 0) {
+      const kind = this._stateToTint[stateId]
+      const column = world.getColumn(chunkX, chunkZ)
+      if (column && typeof column.getBiome === 'function') {
+        POS.x = localX; POS.y = worldY; POS.z = localZ
+        let biomeId = 0
+        try { biomeId = column.getBiome(POS) } catch (e) { biomeId = 0 }
+        tint = this._biomeTintFor(biomeId)[kind - 1] || 0
+      }
+    }
     return {
       x: worldX, y: worldY, z: worldZ,
-      blockId, faceMask
+      blockId, faceMask, tint
     }
   }
 

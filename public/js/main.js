@@ -126,6 +126,8 @@
       Game.onLookChange((yaw, pitch) => renderer.setLocalLook(yaw, pitch))
       const look = Game.getLook()
       renderer.setLocalLook(look.yaw, look.pitch)
+      // Sneak (camera dips) & sprint (FOV widens) local feedback
+      Game.onSneakSprintChange((sneak, sprint) => renderer.setSneakSprint(sneak, sprint))
       // Re-sync the predicted look when the pointer lock is (re)acquired:
       // while unlocked the look follows the server echo, so the prediction
       // must not stay stale from an earlier session.

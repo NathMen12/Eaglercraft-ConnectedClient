@@ -26,6 +26,12 @@ if (!RESOURCE_PACK_PATH) {
   const candidate = path.join(ROOT, 'resourcepack')
   if (fs.existsSync(candidate)) RESOURCE_PACK_PATH = candidate
 }
+// Also accept the legacy misspelled folder (double S) so existing setups
+// keep working after the rename
+if (!RESOURCE_PACK_PATH) {
+  const legacy = path.join(ROOT, 'ressourcepack')
+  if (fs.existsSync(legacy)) RESOURCE_PACK_PATH = legacy
+}
 
 // ---------------------------------------------------------------------------
 // HTTP / WebSocket

@@ -40,11 +40,20 @@ const Game = (() => {
   let lookCallback = null
   function onLookChange (fn) { lookCallback = fn }
 
+  // Sneak/sprint state callbacks: the renderer dips the camera when
+  // sneaking and widens the FOV when sprinting (local feedback, no latency)
+  let sneakSprintCallback = null
+  function onSneakSprintChange (fn) { sneakSprintCallback = fn }
+  function notifySneakSprint () {
+    if (sneakSprintCallback) sneakSprintCallback(state.controls.sneak, state.controls.sprint)
+  }
+
   function isActive () { return state.active }
 
   function start () {
     state.active = true
     bindEvents()
+    loadHudSprites() // async, emoji fallback until loaded
     requestAnimationFrame(tick)
   }
 
@@ -93,10 +102,12 @@ const Game = (() => {
     }
     if (e.key === 'Shift') {
       state.controls.sneak = true
+      notifySneakSprint()
       return
     }
     if (e.key === 'Control') {
       state.controls.sprint = true
+      notifySneakSprint()
       return
     }
     const control = keyMap[e.key]
@@ -109,8 +120,8 @@ const Game = (() => {
   function onKeyUp (e) {
     if (!state.active) return
     if (e.code === 'Space') { state.controls.jump = false; return }
-    if (e.key === 'Shift') { state.controls.sneak = false; return }
-    if (e.key === 'Control') { state.controls.sprint = false; return }
+    if (e.key === 'Shift') { state.controls.sneak = false; notifySneakSprint(); return }
+    if (e.key === 'Control') { state.controls.sprint = false; notifySneakSprint(); return }
     const control = keyMap[e.key]
     if (control) state.controls[control] = false
   }
@@ -149,6 +160,7 @@ const Game = (() => {
 
   function resetControls () {
     for (const k of Object.keys(state.controls)) state.controls[k] = false
+    notifySneakSprint()
   }
 
   // ------------------------------------------------------------------
@@ -226,22 +238,94 @@ const Game = (() => {
   // 20 Hz (every position message), rebuilding the hearts DOM 20 times per
   // second. Now: values cached, DOM touched only on actual change.
   let lastHealthRendered = -1
+  let lastFoodRendered = -1
+  // Vanilla HUD sprites (loaded once from the server's resource pack).
+  // Null while loading / when the server has no pack -> emoji fallback.
+  let hudSprites = null
+  let hudSheetUrl = null
+  let hudSheetSize = { w: 9, h: 54 }
+
+  async function loadHudSprites () {
+    try {
+      const [jsonRes, pngRes] = await Promise.all([
+        fetch('/hud.json'),
+        fetch('/hud.png')
+      ])
+      if (!jsonRes.ok || !pngRes.ok) return
+      const sprites = await jsonRes.json()
+      if (!sprites || !sprites.sprites || !sprites.sprites.heart_full) return
+      const blob = await pngRes.blob()
+      hudSheetUrl = URL.createObjectURL(blob)
+      hudSprites = sprites.sprites
+      hudSheetSize = { w: sprites.sheetWidth || 9, h: sprites.sheetHeight || 54 }
+      lastHealthRendered = -1 // force a re-render with textures
+      lastFoodRendered = -1
+      renderHealthHud()
+    } catch (e) { /* emoji fallback stays active */ }
+  }
+
+  function spriteStyle (el, name) {
+    const s = hudSprites && hudSprites[name]
+    if (!s || !hudSheetUrl) return false
+    el.classList.add('textured')
+    // Icons are displayed at 2x their 9x9 native size (18px, pixelated).
+    el.style.backgroundImage = `url(${hudSheetUrl})`
+    el.style.backgroundPosition = `-${s.x * 2}px -${s.y * 2}px`
+    el.style.backgroundSize = `${hudSheetSize.w * 2}px ${hudSheetSize.h * 2}px`
+    return true
+  }
+
   function updateHud (data) {
     if (data.health !== undefined) state.health = data.health
     if (data.food !== undefined) state.food = data.food
-    renderHearts()
+    renderHealthHud()
   }
-  function renderHearts () {
-    const el = document.getElementById('hearts')
-    if (!el) return
-    const hearts = Math.max(0, Math.min(10, Math.round(state.health / 2)))
-    if (hearts === lastHealthRendered) return
-    lastHealthRendered = hearts
-    el.innerHTML = ''
-    for (let i = 0; i < 10; i++) {
-      const h = document.createElement('div')
-      h.className = 'heart' + (i >= hearts ? ' empty' : '')
-      el.appendChild(h)
+
+  function renderHealthHud () {
+    // Hearts (health / 2, half hearts supported)
+    const heartsEl = document.getElementById('hearts')
+    if (heartsEl) {
+      const hp = Math.max(0, Math.min(20, state.health))
+      const fullHearts = Math.floor(hp / 2)
+      const halfHeart = hp % 2 === 1
+      const signature = `${fullHearts}.${halfHeart ? 5 : 0}`
+      if (signature !== lastHealthRendered) {
+        lastHealthRendered = signature
+        heartsEl.innerHTML = ''
+        for (let i = 0; i < 10; i++) {
+          const h = document.createElement('div')
+          const isFull = i < fullHearts
+          const isHalf = i === fullHearts && halfHeart
+          h.className = 'heart' + (!isFull && !isHalf ? ' empty' : '')
+          const sprite = isFull ? 'heart_full' : isHalf ? 'heart_half' : 'heart_container'
+          if (!spriteStyle(h, sprite)) {
+            // Emoji fallback (no class change keeps the ::before heart)
+            if (!isFull) h.classList.add('empty')
+          }
+          heartsEl.appendChild(h)
+        }
+      }
+    }
+    // Food (food / 2, half icons supported)
+    const foodEl = document.getElementById('food')
+    if (foodEl) {
+      const f = Math.max(0, Math.min(20, state.food))
+      const fullFood = Math.floor(f / 2)
+      const halfFood = f % 2 === 1
+      const signature = `${fullFood}.${halfFood ? 5 : 0}`
+      if (signature !== lastFoodRendered) {
+        lastFoodRendered = signature
+        foodEl.innerHTML = ''
+        for (let i = 0; i < 10; i++) {
+          const d = document.createElement('div')
+          const isFull = i < fullFood
+          const isHalf = i === fullFood && halfFood
+          d.className = 'food-icon'
+          const sprite = isFull ? 'food_full' : isHalf ? 'food_half' : 'food_empty'
+          spriteStyle(d, sprite)
+          foodEl.appendChild(d)
+        }
+      }
     }
   }
 
@@ -315,7 +399,8 @@ const Game = (() => {
 
   return {
     start, stop, isActive, state,
-    updateHud, addChatLine, updateDebug, setPosition, setLook, getLook, onLookChange
+    updateHud, addChatLine, updateDebug, setPosition, setLook, getLook,
+    onLookChange, onSneakSprintChange
   }
 })()
 
