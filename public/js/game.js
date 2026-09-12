@@ -19,9 +19,15 @@ const Game = (() => {
     chatOpen: false
   }
 
-  // Send control states at ~10 Hz
+  // Send control states at ~10 Hz — but only when something actually changed
+  // (controls state OR camera moved). A static client used to send 20
+  // messages/s forever for nothing.
   let lastSent = 0
   const SEND_INTERVAL = 100
+  let lastSentControls = null
+  let lastSentYaw = 0
+  let lastSentPitch = 0
+  const LOOK_EPSILON = 0.01 // ~0.57° — below human perception
 
   function isActive () { return state.active }
 
@@ -38,8 +44,9 @@ const Game = (() => {
     // Release every pressed control on the server, otherwise the bot keeps
     // walking after the client left the game screen.
     resetControls()
+    lastSentControls = null // force a fresh state send on next start
     if (typeof Net !== 'undefined' && Net.isOpen()) {
-      Net.send({ t: 'control', states: state.controls })
+      Net.send({ t: 'control', states: { ...state.controls } })
     }
   }
 
@@ -171,8 +178,24 @@ const Game = (() => {
     if (now - lastSent >= SEND_INTERVAL) {
       lastSent = now
       if (typeof Net !== 'undefined' && Net.isOpen()) {
-        Net.send({ t: 'control', states: state.controls })
-        Net.send({ t: 'look', yaw: state.yaw, pitch: state.pitch })
+        // Controls: send only when the state actually changed
+        const c = state.controls
+        const changed = !lastSentControls ||
+          c.forward !== lastSentControls.forward || c.back !== lastSentControls.back ||
+          c.left !== lastSentControls.left || c.right !== lastSentControls.right ||
+          c.jump !== lastSentControls.jump || c.sneak !== lastSentControls.sneak ||
+          c.sprint !== lastSentControls.sprint
+        if (changed) {
+          lastSentControls = { ...c }
+          Net.send({ t: 'control', states: { ...c } })
+        }
+        // Look: send only when the camera moved since the last send
+        if (Math.abs(state.yaw - lastSentYaw) > LOOK_EPSILON ||
+            Math.abs(state.pitch - lastSentPitch) > LOOK_EPSILON) {
+          lastSentYaw = state.yaw
+          lastSentPitch = state.pitch
+          Net.send({ t: 'look', yaw: state.yaw, pitch: state.pitch })
+        }
       }
     }
     requestAnimationFrame(tick)
@@ -182,6 +205,10 @@ const Game = (() => {
   // HUD
   // ------------------------------------------------------------------
 
+  // HUD updates are throttled: updateHud/renderHearts used to run at up to
+  // 20 Hz (every position message), rebuilding the hearts DOM 20 times per
+  // second. Now: values cached, DOM touched only on actual change.
+  let lastHealthRendered = -1
   function updateHud (data) {
     if (data.health !== undefined) state.health = data.health
     if (data.food !== undefined) state.food = data.food
@@ -190,11 +217,13 @@ const Game = (() => {
   function renderHearts () {
     const el = document.getElementById('hearts')
     if (!el) return
+    const hearts = Math.max(0, Math.min(10, Math.round(state.health / 2)))
+    if (hearts === lastHealthRendered) return
+    lastHealthRendered = hearts
     el.innerHTML = ''
-    const full = Math.max(0, Math.min(10, Math.round(state.health / 2)))
     for (let i = 0; i < 10; i++) {
       const h = document.createElement('div')
-      h.className = 'heart' + (i >= full ? ' empty' : '')
+      h.className = 'heart' + (i >= hearts ? ' empty' : '')
       el.appendChild(h)
     }
   }

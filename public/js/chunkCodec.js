@@ -16,6 +16,15 @@
  */
 
 const ChunkCodec = (() => {
+  // Fast little-endian readers (function-scope, monomorphic)
+  function readInt32 (b, o) {
+    return (b[o]) | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24)
+  }
+
+  function readUint16 (b, o) {
+    return b[o] | (b[o + 1] << 8)
+  }
+
   function decodeChunk (buf) {
     // buf: Uint8Array (already decompressed)
     if (buf.length < 15) throw new Error('chunk payload too short')
@@ -37,14 +46,6 @@ const ChunkCodec = (() => {
       entries[i] = { x, y, z, blockId, faceMask }
     }
     return { chunkX, chunkZ, minY, count, entries }
-  }
-
-  function readInt32 (b, o) {
-    return (b[o]) | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24)
-  }
-
-  function readUint16 (b, o) {
-    return b[o] | (b[o + 1] << 8)
   }
 
   return { decodeChunk }

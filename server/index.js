@@ -295,7 +295,8 @@ function attachWorldStreaming (socket, session, mcData) {
   const streamer = session.streamer
 
   // --- Chunk streaming with a token bucket --------------------------------
-  const chunkQueue = [] // { chunkX, chunkZ }
+  const chunkQueue = [] // { chunkX, chunkZ } — no duplicates (queuedChunks set)
+  const queuedChunks = new Set() // 'cx,cz' currently in the queue
   const sentChunks = new Set() // 'cx,cz'
   let tokens = config.chunkScanRate
   const refillTimer = setInterval(() => { tokens = config.chunkScanRate }, 1000)
@@ -303,8 +304,9 @@ function attachWorldStreaming (socket, session, mcData) {
 
   function queueChunk (cx, cz) {
     const key = `${cx},${cz}`
-    if (sentChunks.has(key)) return
-    chunkQueue.push({ cx, cz })
+    if (sentChunks.has(key) || queuedChunks.has(key)) return
+    queuedChunks.add(key)
+    chunkQueue.push({ cx, cz, key })
   }
 
   // Queue the chunks around the bot on login (all render distance)
@@ -340,18 +342,22 @@ function attachWorldStreaming (socket, session, mcData) {
     queueChunk(Number(c.chunkX), Number(c.chunkZ))
   }
 
-  // Drain loop: send at most `chunkScanRate` chunks per second while
-  // respecting the socket's backpressure.
+  // Drain loop: respects the socket's backpressure and a per-tick CPU budget.
+  // The old version sent AT MOST ONE chunk per 50 ms tick (~20 chunks/s max
+  // whatever the token bucket allowed) — with a 8ms time budget we now send
+  // as many chunks as the event loop can afford without starving the bot.
   const drainTimer = setInterval(() => {
     if (socket.readyState !== WebSocket.OPEN) return
     if (socket.bufferedAmount > config.maxBufferedBytes) return // backpressure
+    const budgetEnd = performance.now() + config.drainBudgetMs
     while (tokens > 0 && chunkQueue.length > 0) {
-      const { cx, cz } = chunkQueue.shift()
-      if (sentChunks.has(`${cx},${cz}`)) continue
-      // Serialize + send is synchronous CPU work on a 1-core box:
-      // limit to one chunk per tick of the drain loop.
+      const { cx, cz, key } = chunkQueue.shift()
+      queuedChunks.delete(key)
+      if (sentChunks.has(key)) continue
       if (sendChunkColumn(cx, cz)) tokens--
-      break
+      // Serialize + send is synchronous CPU work on a 1-core box: stop when
+      // the time budget is spent so the bot's packets are still processed.
+      if (performance.now() >= budgetEnd) break
     }
   }, 50)
   session.cleanup.push(() => clearInterval(drainTimer))
@@ -409,26 +415,24 @@ function attachWorldStreaming (socket, session, mcData) {
   bot.world.on('chunkColumnUnload', onChunkUnload)
   session.cleanup.push(() => bot.world.off('chunkColumnUnload', onChunkUnload))
 
-  // Block updates: patch the client's meshes (single blocks)
+  // Block updates: patch the client's meshes (single blocks). All seven
+  // positions (the block + its 6 neighbours) are batched into ONE message —
+  // sending 7 JSON frames per update was flooding the socket (any fast
+  // world edit = hundreds of messages per second).
   const onBlockUpdate = (oldBlock, newBlock) => {
     // Recompute masks around the updated position, including this block
     const pos = newBlock.position
-    sendJson(socket, {
-      t: 'block_update',
-      block: streamer.serializeBlockUpdate(pos.x, pos.y, pos.z)
-    })
+    const blocks = [streamer.serializeBlockUpdate(pos.x, pos.y, pos.z)]
     // Neighbors may gain/lose visible faces: send their new masks too
-    const neighbors = [
-      [pos.x + 1, pos.y, pos.z], [pos.x - 1, pos.y, pos.z],
-      [pos.x, pos.y + 1, pos.z], [pos.x, pos.y - 1, pos.z],
-      [pos.x, pos.y, pos.z + 1], [pos.x, pos.y, pos.z - 1]
-    ]
-    for (const [nx, ny, nz] of neighbors) {
-      sendJson(socket, {
-        t: 'block_update',
-        block: streamer.serializeBlockUpdate(nx, ny, nz)
-      })
-    }
+    blocks.push(
+      streamer.serializeBlockUpdate(pos.x + 1, pos.y, pos.z),
+      streamer.serializeBlockUpdate(pos.x - 1, pos.y, pos.z),
+      streamer.serializeBlockUpdate(pos.x, pos.y + 1, pos.z),
+      streamer.serializeBlockUpdate(pos.x, pos.y - 1, pos.z),
+      streamer.serializeBlockUpdate(pos.x, pos.y, pos.z + 1),
+      streamer.serializeBlockUpdate(pos.x, pos.y, pos.z - 1)
+    )
+    sendJson(socket, { t: 'block_update', blocks })
   }
   bot.on('blockUpdate', onBlockUpdate)
   session.cleanup.push(() => bot.off('blockUpdate', onBlockUpdate))
@@ -487,6 +491,20 @@ function attachBotEvents (socket, session) {
   session.cleanup.push(() => bot.off('message', onMessage))
 
   // --- Entities ------------------------------------------------------------
+  // entityMoved fires for EVERY entity on EVERY physics tick (20 Hz): with
+  // 50 mobs around that was 1000 JSON messages per second. Updates are now
+  // batched into one message every 100 ms.
+  const pendingEntityUpdates = new Map() // id -> { entity, isNew: false }
+  const entityFlushTimer = setInterval(() => {
+    if (pendingEntityUpdates.size === 0) return
+    if (socket.readyState !== WebSocket.OPEN) { pendingEntityUpdates.clear(); return }
+    const updates = []
+    for (const [, u] of pendingEntityUpdates) updates.push(u)
+    pendingEntityUpdates.clear()
+    sendJson(socket, { t: 'entities', updates })
+  }, 100)
+  session.cleanup.push(() => clearInterval(entityFlushTimer))
+
   const sendEntity = (entity, isNew) => {
     if (!entity) return
     sendJson(socket, {
@@ -500,13 +518,26 @@ function attachBotEvents (socket, session) {
     })
   }
   const onEntitySpawn = (e) => sendEntity(e, true)
-  const onEntityMoved = (e) => sendEntity(e, false)
-  const onEntityGone = (e) => sendJson(socket, { t: 'entity_gone', id: e.id })
+  const onEntityMoved = (e) => {
+    if (!e || e === bot.entity) return
+    pendingEntityUpdates.set(e.id, {
+      id: e.id,
+      name: e.name || e.username || e.type,
+      x: e.position.x, y: e.position.y, z: e.position.z,
+      yaw: e.yaw
+    })
+  }
+  const onEntityGone = (e) => {
+    // A gone entity no longer needs its pending movement update
+    pendingEntityUpdates.delete(e.id)
+    sendJson(socket, { t: 'entity_gone', id: e.id })
+  }
 
   bot.on('entitySpawn', onEntitySpawn)
   bot.on('entityMoved', onEntityMoved)
   bot.on('entityGone', onEntityGone)
   session.cleanup.push(() => {
+    clearInterval(entityFlushTimer)
     bot.off('entitySpawn', onEntitySpawn)
     bot.off('entityMoved', onEntityMoved)
     bot.off('entityGone', onEntityGone)

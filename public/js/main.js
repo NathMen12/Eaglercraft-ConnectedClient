@@ -141,16 +141,29 @@
       if (renderer && renderer.ready) {
         renderer.updateCamera(msg.x, msg.y, msg.z, msg.yaw, msg.pitch)
       }
-      Game.updateDebug(renderer ? renderer.fps : 0,
-        `Serveur: ${currentServer ? currentServer.host + ':' + currentServer.port : '?'}\n` +
-        `Santé: ${msg.health ?? '?'}  Nourriture: ${msg.food ?? '?'}`)
+      // Debug HUD at 4 Hz: building the debug string on every position
+      // message (20 Hz) forced a layout thrash 20 times per second.
+      const now = performance.now()
+      if (now - lastDebugUpdate > 250) {
+        lastDebugUpdate = now
+        Game.updateDebug(renderer ? renderer.fps : 0,
+          `Serveur: ${currentServer ? currentServer.host + ':' + currentServer.port : '?'}\n` +
+          `Santé: ${msg.health ?? '?'}  Nourriture: ${msg.food ?? '?'}`)
+      }
     })
+    let lastDebugUpdate = 0
 
     Net.on('health', (msg) => Game.updateHud(msg))
 
     Net.on('chat', (msg) => Game.addChatLine(msg.from, msg.text))
 
     Net.on('entity', (msg) => {
+      if (renderer && renderer.ready) renderer.handleEntity(msg)
+    })
+
+    // Batched entity movement updates (one message every ~100 ms instead of
+    // one message per entity per physics tick)
+    Net.on('entities', (msg) => {
       if (renderer && renderer.ready) renderer.handleEntity(msg)
     })
 
@@ -177,7 +190,9 @@
     })
 
     Net.on('block_update', (msg) => {
-      if (renderer && renderer.ready) renderer.handleBlockUpdate(msg.block)
+      // Server sends a batched array ({ blocks: [...] }); the renderer also
+      // accepts a single block object for compatibility.
+      if (renderer && renderer.ready) renderer.handleBlockUpdate(msg.blocks || msg.block)
     })
 
     // Binary chunks

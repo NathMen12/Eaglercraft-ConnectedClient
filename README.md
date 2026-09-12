@@ -46,7 +46,8 @@ Pensée pour un petit serveur (1 core / 2.5 Go RAM) — valeurs par défaut prud
 | `MAX_QUEUE_SIZE` | `8` | Clients en file d'attente max |
 | `QUEUE_TIMEOUT_MS` | `600000` | Attente max en file avant abandon |
 | `RENDER_DISTANCE` | `4` | Chunks streamés autour du bot |
-| `CHUNK_SCAN_RATE` | `8` | Chunks/s envoyés à un client (CPU) |
+| `CHUNK_SCAN_RATE` | `30` | Chunks/s envoyés à un client (CPU) |
+| `DRAIN_BUDGET_MS` | `8` | Budget CPU (ms) par tick de streaming |
 | `CHUNK_SEND_RATE` | — | *(réservé)* |
 | `MAX_BUFFERED_BYTES` | `4194304` | Backpressure : pause si le socket client sature |
 | `RESOURCE_PACK_PATH` | auto (`./resourcepack`) | Pack de ressources vanilla **extrait** (optionnel) |
@@ -78,9 +79,40 @@ textures Mojang ne sont pas redistribuables, fais-le localement) et place le dos
   compression). Les blocs enterrés ne quittent jamais le serveur.
 - **Bordures de chunks** : quand un chunk voisin charge, les 4 voisins déjà envoyés sont
   rescannés pour corriger les faces devenues cachées.
-- **Deflate** (zlib) sur chaque chunk : ~75 % de taille en moins.
-- **Mises à jour de blocs** : patch incrémental (bloc + 6 voisins) sans re-scan complet.
+- **Deflate** (zlib niveau 1) sur chaque chunk : ~75 % de taille en moins, compression quasi-instantanée.
+- **Mises à jour de blocs** : patch incrémental batché (bloc + 6 voisins en 1 message) sans re-scan complet.
 - **Backpressure** : le streaming se met en pause si le socket du navigateur sature.
+- **Entités** : mouvements batchés (1 message / 100 ms) puis interpolés côté client.
+
+## Optimisations V1.0.1 (performances)
+
+Serveur :
+- **Lecture directe des sections** : chaque section 16×16×16 est aplatie en `Uint32Array`
+  (extraction de bits inline) au lieu d'un appel `getBlockStateId()` par bloc — scan
+  ~2× plus rapide, zéro allocation d'objets position.
+- **Sections vides ignorées** (`solidBlockCount === 0`) : 60–80 % d'une colonne réelle
+  n'est jamais lue.
+- **Tables précalculées** stateId → blockId / skip / visible (typées) : une lecture
+  tableau par voisin au lieu de lookups Map + Set.
+- **Drain budget CPU** : autant de chunks que possible dans 8 ms/tick (au lieu d'1
+  chunk/50 ms), file dédupliquée.
+- **Mises à jour de blocs batchées** (7 positions → 1 message JSON), sans allocation
+  de `Block`/`Vec3` (usage : `world.getBlockStateId` + pos réutilisée).
+
+Client :
+- **Antialias OFF + pixelRatio ≤ 1.5** : gros gain GPU (~40 % de pixels en moins sur
+  écran hidpi), textures voxel pixelisées qui le masquent bien.
+- **Géométrie par chunk** : constantes de faces hors boucle, UV rects et infos bloc
+  cachés (Map) — build quasi sans allocation temporaire.
+- **Rebuilds budgetés** : les chunks modifiés sont reconstruits dans un budget de
+  6 ms/frame — plus de freezes sur les éditions de monde.
+- **Index O(1)** des blocs par chunk pour les patches (l'ancien `findIndex`
+  parcourait ~30k entrées par bloc modifié).
+- **HUD throttlé** (cœurs, debug) : le DOM n'est touché que sur changement réel.
+- **Réseau client économe** : contrôle/look envoyés seulement quand ils changent ;
+  entités interpolées localement à 60 fps.
+- **Fuite GPU corrigée** : geometry/material/texture des entités supprimées sont
+  désormais `dispose()`.
 
 ## Architecture
 
@@ -109,6 +141,7 @@ test/
 ```bash
 node test/streamer.test.js   # culling + sérialisation binaire (aucun serveur nécessaire)
 node test/queue.test.js      # file d'attente et promotion
+node test/bench.streamer.js  # benchmark du scan de chunks (ms/chunk)
 node test/e2e.js [host] [port]  # bout-en-bout contre un serveur Minecraft
 ```
 

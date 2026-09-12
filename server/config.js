@@ -32,7 +32,7 @@ if (!RESOURCE_PACK_PATH) {
 // ---------------------------------------------------------------------------
 
 const config = {
-  port: intFromEnv('PORT', 3000),
+  port: intFromEnv('PORT', 3005),
   host: process.env.HOST || '0.0.0.0',
 
   // Max size (bytes) of the outbound binary queue for one client before the
@@ -57,7 +57,13 @@ const config = {
   // Number of chunks around the bot that are streamed to the client.
   renderDistance: intFromEnv('RENDER_DISTANCE', 4),
   // Max chunks streamed per second (protects the CPU on a 1-core box).
-  chunkScanRate: intFromEnv('CHUNK_SCAN_RATE', 8),
+  // 8/s meant 6+ seconds to fill a render distance of 4 (49 chunks) —
+  // 30/s loads the same view in ~1.6 s while section-skipping keeps the
+  // per-chunk scan cheap.
+  chunkScanRate: intFromEnv('CHUNK_SCAN_RATE', 30),
+  // Per-tick CPU budget (ms) of the chunk drain loop: serialization runs
+  // synchronously on the event loop; this keeps the bot responsive.
+  drainBudgetMs: intFromEnv('DRAIN_BUDGET_MS', 8),
   // Compact binary chunks are deflated before being sent.
   chunkCompression: process.env.CHUNK_COMPRESSION !== '0'
 }

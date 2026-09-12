@@ -117,4 +117,57 @@ const totalBlocks = 16 * 16 * (worldHeight - 2) // rough
 const ratio = (1 - payload.length / raw.length) * 100
 console.log(`✓ deflate compression: ${raw.length} -> ${payload.length} bytes (${ratio.toFixed(0)}% saved)`)
 
+// Parity test: fast (flattened) scan vs slow (getBlockStateId) scan must
+// produce IDENTICAL entries on a mixed-content 1.21 column.
+const column2 = new ChunkColumn()
+{
+  const minY2 = column2.minY
+  const glass = mcData.blocksByName.glass
+  const torch = mcData.blocksByName.torch
+  const water = mcData.blocksByName.water
+  const log = mcData.blocksByName.oak_log
+  // Messy column: layers + scattered blocks + transparency mix
+  for (let x = 0; x < 16; x++) {
+    for (let z = 0; z < 16; z++) {
+      column2.setBlock({ x, y: minY2, z }, { stateId: bedrock.defaultState, biome: 1 })
+      column2.setBlock({ x, y: minY2 + 1, z }, { stateId: stone.defaultState, biome: 1 })
+    }
+  }
+  for (let i = 0; i < 64; i++) {
+    column2.setBlock({ x: i & 15, y: minY2 + 2 + (i % 8), z: (i * 7) & 15 }, {
+      stateId: [glass.defaultState, torch.defaultState, water.defaultState, log.defaultState][i % 4], biome: 1
+    })
+  }
+}
+const fakeBot2 = {
+  world: {
+    getColumn: (cx, cz) => (cx === 0 && cz === 0 ? column2 : null),
+    getLoadedColumn: (cx, cz) => (cx === 0 && cz === 0 ? column2 : null)
+  }
+}
+const streamer2 = new WorldStreamer({ bot: fakeBot2, mcData, renderDistance: 4 })
+
+const fast = streamer2.serializeChunk(0, 0)
+// Force the slow path: wrap the column so only the getBlockStateId-based
+// interface is exposed (no sections array -> generic scan branch)
+const wrappedColumn = {
+  get minY () { return column2.minY },
+  get worldHeight () { return column2.worldHeight },
+  getBlockStateId: (pos) => column2.getBlockStateId(pos)
+}
+const fakeBotSlow = {
+  world: {
+    getColumn: (cx, cz) => (cx === 0 && cz === 0 ? wrappedColumn : null),
+    getLoadedColumn: (cx, cz) => (cx === 0 && cz === 0 ? wrappedColumn : null)
+  }
+}
+const streamerSlow = new WorldStreamer({ bot: fakeBotSlow, mcData, renderDistance: 4 })
+const slow = streamerSlow.serializeChunk(0, 0)
+
+assert(fast && slow, 'both paths produced a payload')
+const inflate = (buf) => zlib.inflateSync(buf).toString('base64')
+assert.strictEqual(inflate(fast), inflate(slow), 'fast scan (flattened sections) === slow scan (getBlockStateId)')
+console.log('✓ fast/slow scan parity on mixed-content column (glass/torch/water/log)')
+console.log(`  payload: ${fast.length} bytes`)
+
 console.log('\nAll streamer unit tests passed ✓')

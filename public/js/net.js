@@ -51,7 +51,6 @@ const Net = (() => {
         let msg
         try { msg = JSON.parse(ev.data) } catch (e) { return }
         emit(msg.t, msg)
-        emit('*', msg) // wildcard
       } else {
         // Binary frame: deflated chunk -> inflate -> decode -> notify.
         // Buffer chunks that arrive before any handler is registered
@@ -66,25 +65,27 @@ const Net = (() => {
   }
 
   /**
-   * Full binary pipeline: blob -> arrayBuffer -> inflate (deflate) ->
-   * ChunkCodec.decodeChunk -> binary handlers receive a decoded chunk
-   * object { chunkX, chunkZ, minY, count, entries }.
+   * Full binary pipeline: inflate (deflate) -> ChunkCodec.decodeChunk ->
+   * binary handlers receive a decoded chunk object
+   * { chunkX, chunkZ, minY, count, entries }.
+   *
+   * Perf: the payload is piped through the DecompressionStream reader
+   * directly — the old code wrapped it in a Response, then a Blob, then
+   * copied the pieces into one buffer (3 copies + 2 allocations per chunk).
    */
   function dispatchBinary (data) {
-    new Response(data).arrayBuffer().then((ab) => {
-      inflateChunk(new Uint8Array(ab), (raw) => {
-        let decoded
-        try {
-          decoded = window.ChunkCodec.decodeChunk(raw)
-        } catch (e) {
-          console.error('chunk decode failed', e)
-          return
-        }
-        for (const fn of binaryHandlers) {
-          try { fn(decoded) } catch (e) { console.error('binary handler error', e) }
-        }
-      })
-    }).catch((e) => console.error('chunk inflate failed', e))
+    inflateChunk(data, (raw) => {
+      let decoded
+      try {
+        decoded = window.ChunkCodec.decodeChunk(raw)
+      } catch (e) {
+        console.error('chunk decode failed', e)
+        return
+      }
+      for (const fn of binaryHandlers) {
+        try { fn(decoded) } catch (e) { console.error('binary handler error', e) }
+      }
+    })
   }
 
   /** Decompresses (zlib deflate) a chunk payload using the Compression API. */
