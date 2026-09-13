@@ -37,7 +37,16 @@ const Game = (() => {
   // loaded (name -> { url, tile } or null when the server has none).
   let itemIconProvider = null
   function setItemIconProvider (fn) { itemIconProvider = fn }
-  function getItemIcon (name) { return itemIconProvider ? itemIconProvider(name) : null }
+  /**
+   * V1.1.3 — item names come from the TARGET Minecraft server (untrusted):
+   * validate the identifier before it reaches a URL/style sink. Vanilla ids
+   * are [a-z0-9_]+; anything else renders no icon (plain slot) instead of
+   * being injected into CSS url().
+   */
+  function getItemIcon (name) {
+    if (typeof name !== 'string' || !/^[a-z0-9_]{1,64}$/.test(name)) return null
+    return itemIconProvider ? itemIconProvider(name) : null
+  }
 
   /**
    * Hotbar selection. notifyServer=false when the change originates from a
@@ -370,7 +379,9 @@ const Game = (() => {
       hudSheetSize = { w: sprites.sheetWidth || 9, h: sprites.sheetHeight || 54 }
       lastHealthRendered = -1 // force a re-render with textures
       lastFoodRendered = -1
+      lastHotbarSignature = '' // hotbar chrome may be available now
       renderHealthHud()
+      renderHotbar()
     } catch (e) { /* emoji fallback stays active */ }
   }
 
@@ -403,45 +414,72 @@ const Game = (() => {
     const sig = state.selectedSlot + '|' + state.hotbar.map((s) => s ? `${s.name}:${s.count}` : '-').join(',')
     if (sig === lastHotbarSignature) return
     lastHotbarSignature = sig
+    // V1.1.2 — vanilla chrome: hud/hotbar.png (182x22) as the bar
+    // background + hud/hotbar_selection.png (24x23) over the selected slot.
+    // Scale 3x => 546x66 bar, 20px cell pitch, item icons in 36px cells.
+    const chrome = hudSprites && hudSprites.hotbar && hudSheetUrl
+    if (chrome) {
+      bar.classList.add('textured')
+      bar.style.backgroundImage = `url(${hudSheetUrl})`
+      const hb = hudSprites.hotbar
+      bar.style.backgroundPosition = `-${hb.x * 3}px -${hb.y * 3}px`
+      bar.style.backgroundSize = `${hudSheetSize.w * 3}px ${hudSheetSize.h * 3}px`
+      bar.style.width = `${hb.w * 3}px`
+      bar.style.height = `${hb.h * 3}px`
+      bar.style.padding = `${3}px ${3}px`
+      bar.style.gap = '0px'
+      bar.style.boxSizing = 'border-box'
+    }
     bar.innerHTML = ''
+    const sel = hudSprites && hudSprites.hotbar_selection && hudSheetUrl
+      ? hudSprites.hotbar_selection : null
     for (let i = 0; i < 9; i++) {
       const slot = document.createElement('div')
       slot.className = 'hotbar-slot' + (i === state.selectedSlot ? ' selected' : '')
-      const item = state.hotbar[i]
-      if (item) {
-        const icon = getItemIcon(item.name)
-        if (icon) {
-          const img = document.createElement('div')
-          img.className = 'hotbar-icon'
-          img.style.backgroundImage = `url(${icon.url})`
-          // Icon tile position in the 64x64 atlas (16px tiles, 2x upscale)
-          const tx = (icon.tile % 64) * 32
-          const ty = Math.floor(icon.tile / 64) * 32
-          img.style.backgroundPosition = `-${tx}px -${ty}px`
-          img.style.backgroundSize = '2048px 2048px'
-          slot.appendChild(img)
-        } else {
-          const fallback = document.createElement('div')
-          fallback.className = 'hotbar-icon hotbar-icon-fallback'
-          slot.appendChild(fallback)
-        }
-        if (item.count > 1) {
-          const count = document.createElement('span')
-          count.className = 'hotbar-count'
-          count.textContent = item.count > 99 ? '99+' : String(item.count)
-          slot.appendChild(count)
+      if (chrome) {
+        // Vanilla geometry: 1px border, 20px pitch, items in 18px cells
+        slot.style.width = '20px'
+        slot.style.height = '20px'
+        slot.style.background = 'transparent'
+        slot.style.border = 'none'
+        slot.style.padding = '1px'
+        // Selection box overlay (24x23 @3x = 72x69) centered on the cell
+        if (sel && i === state.selectedSlot) {
+          slot.style.backgroundImage = `url(${hudSheetUrl})`
+          slot.style.backgroundPosition = `-${sel.x * 3}px -${sel.y * 3}px`
+          slot.style.backgroundSize = `${hudSheetSize.w * 3}px ${hudSheetSize.h * 3}px`
+          slot.style.backgroundRepeat = 'no-repeat'
+          // The selection sprite is 2px wider/taller than the cell: grow the
+          // box and pull the icon back so the frame stays centered.
+          slot.style.width = '24px'
+          slot.style.height = '23px'
+          slot.style.marginLeft = i === 0 ? '0px' : '-4px'
+          slot.style.marginTop = '-1px'
+          slot.style.padding = '2px 2px 2px 4px'
         }
       }
-      // Slot number (vanilla-like, only on the selected one for now)
-      if (i === state.selectedSlot) slot.title = `Slot ${i + 1}`
+      const item = state.hotbar[i]
+      if (item) fillItemEl(slot, item, chrome ? 48 : 32) // 3x scale in vanilla chrome mode
       bar.appendChild(slot)
     }
+  }
+
+  /** V1.1.3 — sanitizes a server-pushed item: { name, count } or null.
+   *  Names are untrusted (target MC server); anything that is not a valid
+   *  item identifier becomes null (empty slot) so it can never reach DOM
+   *  styles or the renderer. */
+  function sanitizeItem (item) {
+    if (!item || typeof item !== 'object') return null
+    const name = item.name
+    if (typeof name !== 'string' || !/^[a-z0-9_]{1,64}$/.test(name)) return null
+    const count = Number(item.count)
+    return { name, count: Number.isFinite(count) && count > 0 ? Math.min(Math.floor(count), 65535) : 1 }
   }
 
   /** Full hotbar update from a server {t:'hotbar'} snapshot. */
   function updateHotbar (msg) {
     if (!Array.isArray(msg.slots) || msg.slots.length !== 9) return
-    state.hotbar = msg.slots.map((s) => s ? { name: s.name, count: s.count } : null)
+    state.hotbar = msg.slots.map(sanitizeItem)
     if (typeof msg.selected === 'number' && msg.selected >= 0 && msg.selected <= 8) {
       state.selectedSlot = msg.selected
     }
@@ -455,7 +493,7 @@ const Game = (() => {
    *  full hotbar push — main.js translates and calls this). */
   function updateHotbarSlot (index, item) {
     if (index < 0 || index > 8) return
-    state.hotbar[index] = item ? { name: item.name, count: item.count } : null
+    state.hotbar[index] = sanitizeItem(item)
     state.inventory[index] = state.hotbar[index]
     renderHotbar()
     if (state.inventoryOpen) renderInventory()
@@ -464,6 +502,27 @@ const Game = (() => {
   // ------------------------------------------------------------------
   // Inventory screen (V1.1.1 — E key)
   // ------------------------------------------------------------------
+
+  // Vanilla inventory geometry (from container/inventory.png), scaled 3x
+  const INV_SCALE = 3
+  const INV_CELL = 18 * INV_SCALE // 54px cells
+  const INV_GRID_X = 7 * INV_SCALE // grid origin (col 0, row 0 of the 27)
+  const INV_GRID_Y = 17 * INV_SCALE
+  const INV_HOTBAR_Y = 75 * INV_SCALE
+  const INV_PANEL_W = 176 * INV_SCALE
+  const INV_PANEL_H = 166 * INV_SCALE
+  let invBgUrl = null // /gui/inventory.png object URL (null until loaded)
+
+  /** Loads the vanilla-style panel background once. */
+  async function loadInventoryBg () {
+    if (invBgUrl !== null) return
+    try {
+      const res = await fetch('/gui/inventory.png')
+      if (!res.ok) { invBgUrl = false; return }
+      invBgUrl = URL.createObjectURL(await res.blob())
+      if (state.inventoryOpen) renderInventory()
+    } catch (e) { invBgUrl = false }
+  }
 
   /** Server slot index -> client inventory index (hotbar 36-44 -> 0-8). */
   function serverSlotToClient (index) {
@@ -476,6 +535,7 @@ const Game = (() => {
     state.pickedSlot = null
     document.getElementById('inventory-screen').classList.remove('hidden')
     if (document.pointerLockElement) document.exitPointerLock()
+    loadInventoryBg()
     renderInventory()
   }
 
@@ -485,27 +545,63 @@ const Game = (() => {
     document.getElementById('inventory-screen').classList.add('hidden')
   }
 
-  /** Builds the DOM slots once, then only refreshes icons/counts. */
-  let invDomBuilt = false
+  /** Builds the DOM slots; REBUILDS them when the background becomes
+   *  available (first open may happen before /gui/inventory.png loads).
+   *  Layout: absolute cells over the vanilla panel, or the CSS grid. */
+  let invDomMode = '' // '' | 'grid' | 'bg'
   function ensureInvDom () {
-    if (invDomBuilt) return
-    invDomBuilt = true
+    const mode = invBgUrl ? 'bg' : 'grid'
+    if (invDomMode === mode) return
+    invDomMode = mode
     const grid = document.getElementById('inventory-grid')
     const hot = document.getElementById('inventory-hotbar')
-    for (let i = 9; i < 36; i++) grid.appendChild(buildInvSlotEl(i))
-    for (let i = 0; i < 9; i++) hot.appendChild(buildInvSlotEl(i))
+    grid.innerHTML = ''
+    hot.innerHTML = ''
+    const useBg = mode === 'bg'
+    // Client inventory indexes: 0-8 = hotbar row (vanilla bottom row),
+    // 9-35 = main grid rendered as 3 rows of 9.
+    for (let i = 9; i < 36; i++) grid.appendChild(buildInvSlotEl(i, useBg))
+    for (let i = 0; i < 9; i++) hot.appendChild(buildInvSlotEl(i, useBg))
   }
 
-  function buildInvSlotEl (clientIndex) {
+  function buildInvSlotEl (clientIndex, useBg) {
     const el = document.createElement('div')
     el.className = 'inv-slot'
     el.dataset.slot = String(clientIndex)
+    if (useBg) {
+      // Absolute cell over the drawn background (vanilla coordinates)
+      const col = clientIndex % 9
+      const isHotbar = clientIndex < 9
+      const row = isHotbar ? 0 : Math.floor((clientIndex - 9) / 9)
+      el.style.position = 'absolute'
+      el.style.left = `${INV_GRID_X + col * INV_CELL}px`
+      el.style.top = `${(isHotbar ? INV_HOTBAR_Y : INV_GRID_Y) + row * INV_CELL}px`
+      el.style.width = `${INV_CELL}px`
+      el.style.height = `${INV_CELL}px`
+      el.style.background = 'transparent'
+      el.style.border = 'none'
+      el.style.padding = `${1 * INV_SCALE}px` // 1px vanilla padding *3
+    }
     el.addEventListener('click', onInventorySlotClick)
     return el
   }
 
   function renderInventory () {
     ensureInvDom()
+    const panel = document.getElementById('inventory-panel')
+    if (invBgUrl) {
+      // Vanilla panel: background image + absolute slots, title hidden
+      panel.classList.add('textured')
+      panel.style.backgroundImage = `url(${invBgUrl})`
+      panel.style.backgroundSize = `${INV_PANEL_W}px ${INV_PANEL_H}px`
+      panel.style.width = `${INV_PANEL_W}px`
+      panel.style.height = `${INV_PANEL_H}px`
+      panel.style.padding = '0'
+      panel.style.borderRadius = '0'
+      panel.querySelector('h3').style.display = 'none'
+      document.getElementById('inventory-grid').style.display = 'block'
+      document.getElementById('inventory-hotbar').style.display = 'block'
+    }
     const slots = document.querySelectorAll('#inventory-screen .inv-slot')
     for (const el of slots) {
       const i = parseInt(el.dataset.slot, 10)
@@ -514,12 +610,13 @@ const Game = (() => {
       const picked = state.pickedSlot === i
       el.classList.toggle('picked', picked)
       el.classList.toggle('in-hotbar', i < 9)
-      fillItemEl(el, item)
+      fillItemEl(el, item, 16 * INV_SCALE)
     }
   }
 
-  /** Writes icon + count into a slot element (shared by hotbar & inventory). */
-  function fillItemEl (el, item) {
+  /** Writes icon + count into a slot element (shared by hotbar & inventory).
+   *  iconSize = the icon's rendered size in px (16 vanilla-style, 32 HUD). */
+  function fillItemEl (el, item, iconSize = 32) {
     // Keep the click listener on the parent: rebuild children only
     const icon = el.querySelector('.hotbar-icon, .inv-icon')
     if (icon) icon.remove()
@@ -531,10 +628,17 @@ const Game = (() => {
     const iconInfo = getItemIcon(item.name)
     if (iconInfo) {
       img.style.backgroundImage = `url(${iconInfo.url})`
-      const tx = (iconInfo.tile % 64) * 32
-      const ty = Math.floor(iconInfo.tile / 64) * 32
+      const tx = (iconInfo.tile % 64) * iconSize
+      const ty = Math.floor(iconInfo.tile / 64) * iconSize
       img.style.backgroundPosition = `-${tx}px -${ty}px`
-      img.style.backgroundSize = '2048px 2048px'
+      img.style.backgroundSize = `${64 * iconSize}px ${64 * iconSize}px`
+      img.style.width = `${iconSize}px`
+      img.style.height = `${iconSize}px`
+      img.style.position = 'absolute'
+      img.style.left = '50%'
+      img.style.top = '50%'
+      img.style.transform = 'translate(-50%, -50%)'
+      img.style.inset = 'auto'
     } else {
       img.classList.add('hotbar-icon-fallback')
     }
@@ -594,7 +698,7 @@ const Game = (() => {
   function updateInventorySlot (serverIndex, item) {
     const i = serverSlotToClient(serverIndex)
     if (i < 0 || i > 35) return
-    state.inventory[i] = item ? { name: item.name, count: item.count } : null
+    state.inventory[i] = sanitizeItem(item)
     if (i < 9) {
       state.hotbar[i] = state.inventory[i]
       renderHotbar()
@@ -653,15 +757,19 @@ const Game = (() => {
   function addChatLine (from, text) {
     const box = document.getElementById('chat-messages')
     if (!box) return
+    // V1.1.3 — untrusted input (comes from the TARGET Minecraft server):
+    // bound so a hostile server can't build a giant DOM / memory balloon.
+    const safeFrom = typeof from === 'string' ? from.slice(0, 64) : null
+    const safeText = String(text == null ? '' : text).slice(0, 512)
     const line = document.createElement('div')
-    line.className = 'chat-line' + (from ? '' : ' system')
-    if (from) {
+    line.className = 'chat-line' + (safeFrom ? '' : ' system')
+    if (safeFrom) {
       const f = document.createElement('span')
       f.className = 'from'
-      f.textContent = `<${from}> `
+      f.textContent = `<${safeFrom}> `
       line.appendChild(f)
     }
-    line.appendChild(document.createTextNode(text))
+    line.appendChild(document.createTextNode(safeText))
     box.appendChild(line)
     while (box.children.length > 60) box.removeChild(box.firstChild)
     box.scrollTop = box.scrollHeight

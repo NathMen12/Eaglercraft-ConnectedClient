@@ -34,8 +34,8 @@ La page passe au rendu 3D dès que le bot est connecté.
 | `Souris (clic sur le canvas)` | Capturer la souris — pivoter la caméra (prédiction locale, 0 latence) |
 | `Clic gauche` | Miner le bloc visé (contour noir = ciblage, fissures = progression) |
 | `Clic droit` | Poser le bloc tenu contre la face visée / utiliser l'item |
-| `Molette` / `1`-`9` | Sélectionner un slot de la hotbar |
-| `E` | **Inventaire** — grille 27 + hotbar, déplace les items par 2 clics |
+| `Molette` / `1`-`9` | Sélectionner un slot de la hotbar (chrome + sélection vanilla) |
+| `E` | **Inventaire** — panneau vanilla 3x (grille 27 + hotbar), déplace les items par 2 clics |
 | `R` | **Recharger les chunks** — vide le cache client (meshes + données) et le set serveur, puis re-scanne tout depuis zéro (fix des blocs fantômes) |
 | `Échap` | Relâcher la souris (stoppe le mouvement) |
 | `T` ou `/` | Ouvrir le chat (`Entrée` envoie, `Échap` annule) |
@@ -56,6 +56,7 @@ Pensée pour un petit serveur (1 core / 2.5 Go RAM) — valeurs par défaut prud
 | `CHUNK_SEND_RATE` | — | *(réservé)* |
 | `MAX_BUFFERED_BYTES` | `4194304` | Backpressure : pause si le socket client sature |
 | `RESOURCE_PACK_PATH` | auto (`./resourcepack`) | Pack de ressources vanilla **extrait** (optionnel) |
+| `ALLOW_PRIVATE_SERVERS` | `0` | ⚠️ Autoriser les serveurs Minecraft sur des adresses privées (développement local uniquement) |
 
 ### File d'attente
 
@@ -129,27 +130,59 @@ Client :
 - **Fuite GPU corrigée** : geometry/material/texture des entités supprimées sont
   désormais `dispose()`.
 
+## Sécurité (V1.1.3)
+
+Le serveur relayaît aveuglément les requêtes `connect` vers n'importe quel host:port
+(un **pivot SSRF** vers votre LAN / le metadata cloud). Durcissements appliqués :
+
+- **SSRF bloqué** : les serveurs Minecraft cibles doivent résoudre vers une adresse
+  **publique** — localhost, RFC1918 (10/172.16/192.168), link-local, CGNAT,
+  multicast, IPv6 ULA et `169.254.169.254` (metadata AWS/GCP) sont refusés.
+  Hostnames : toutes les adresses A/AAAA sont vérifiées. (`ALLOW_PRIVATE_SERVERS=1`
+  pour le dev local uniquement.)
+- **Payload WS borné** (`maxPayload` 64 KB) : la valeur par défaut de `ws` (512 Mo)
+  permettait à un seul client d'OOMer le serveur.
+- **Rate limiting par socket** (token bucket : rafale 60, recharge 30/s) : le flood
+  de messages `dig`/`place`/`look` n'épuise plus le CPU ; le client légitime
+  (~25 msg/s max) ne le déclenche jamais.
+- **CSWSH** : les handshakes WebSocket cross-origin sont rejetés (Origin ≠ Host).
+- **Headers de sécurité** sur chaque réponse : CSP stricte (`default-src 'self'`,
+  `object-src 'none'`), `X-Content-Type-Options`, `X-Frame-Options: DENY`,
+  `Referrer-Policy`, `Permissions-Policy`, `Cross-Origin-Opener-Policy`.
+- **Validation d'entrée** : `host` limité à `[a-zA-Z0-9._-]` (pas de scheme/userinfo),
+  `req.query.v` de `/blocks.json` validé (regex version + cache borné), messages WS
+  non-objets ignorés.
+- **Contenus non fiables bornés** (le serveur Minecraft cible peut être hostile) :
+  noms d'items (`[a-z0-9_]{1,64}`, filtrés côté serveur **et** client), chat
+  (64/512 chars), noms d'entités (64) — défense en profondeur.
+- **XSS corrigé** dans le menu : rendu par `textContent`/`dataset` (l'ancien
+  template interpolait `port` et `data-id` sans échappement et crashait sur les
+  noms vides).
+
 ## Architecture
 
 ```
 server/
-  index.js         Express (static + /atlas.png + /blocks.json + /items.png) + WebSocket /ws
+  index.js         Express (static + /atlas.png + /blocks.json + /items.png + /gui) + WebSocket /ws
   config.js        Configuration (env vars)
+  security.js      SSRF guard, rate limiter, security headers (V1.1.3)
   botManager.js    File d'attente + cycle de vie des bots Mineflayer
-  worldStreamer.js Culling des faces visibles + sérialisation binaire + deflate
-  resourcePack.js  Atlas de textures (pack vanilla ou procédural) + atlas d'items + HUD
+  worldStreamer.js Culling des faces visibles + sérialisation binaire + deflate + tint biome
+  resourcePack.js  Atlas de textures (pack vanilla ou procédural) + atlas d'items + HUD + GUI
+  entityModels.js  Modèles 3D style vanilla des mobs (parts + UV 64x64 + textures)
 public/
   js/net.js        Client WebSocket (JSON + binaire + DecompressionStream)
   js/chunkCodec.js Décodeur du format binaire des chunks (v1 & v2 tint)
   js/voxelRaycast.js Raycast DDA voxel (ciblage des blocs — testé unitairement)
   js/menu.js       Liste des serveurs (localStorage) + formulaire
-  js/game.js       Contrôles clavier/souris, HUD, chat, hotbar
-  js/renderer.js   Rendu Three.js : chunks, entités, caméra, ciblage + contour
+  js/game.js       Contrôles clavier/souris, HUD, chat, hotbar vanilla, inventaire
+  js/renderer.js   Rendu Three.js : chunks tintés, entités modélisées, caméra, main, minage
   js/main.js       Orchestration des écrans et du câblage
 test/
-  streamer.test.js Test unitaire du culling/streaming (sans serveur MC)
+  streamer.test.js Test unitaire du culling/streaming + codec client + tint biome
   raycast.test.js  Test unitaire du raycast DDA (ciblage, faces, transparence)
   queue.test.js    Test unitaire de la file d'attente
+  security.test.js Test unitaire du durcissement (SSRF, rate limiter, validation)
   e2e.js           Test E2E WebSocket → bot Mineflayer → streaming
 ```
 
@@ -159,6 +192,7 @@ test/
 node test/streamer.test.js   # culling + sérialisation binaire + codec client (aucun serveur nécessaire)
 node test/raycast.test.js    # raycast DDA : faces, blocs transparents, portée
 node test/queue.test.js      # file d'attente et promotion
+node test/security.test.js   # SSRF, rate limiter, validation des entrées
 node test/bench.streamer.js  # benchmark du scan de chunks (ms/chunk)
 node test/e2e.js [host] [port]  # bout-en-bout contre un serveur Minecraft
 ```
@@ -166,9 +200,10 @@ node test/e2e.js [host] [port]  # bout-en-bout contre un serveur Minecraft
 ## Limitations connues
 
 - Connexion **offline-mode** uniquement (pas d'auth Mojang).
-- Entités rendues en boîtes colorées + nametags (pas de skins/models animés) — v1.2.
+- Mobs rendus avec des **modèles 3D style vanilla** (zombie, creeper, skeleton,
+  spider, enderman, pig, cow, sheep, chicken, villager… 19 mobs) — les autres
+  entités restent des boîtes colorées. Pas d'animation de marche pour l'instant.
 - Inventaire : déplacement d'items par paires de clics (pas de drag & drop continu),
-  pas d'armure/craft — v1.2. Le minage n'a pas d'animation de progression côté
-  serveur mais affiche les fissures vanilla côté client.
+  pas d'armure/craft — v1.3. Le minage affiche les fissures vanilla côté client.
 - Un bot par onglet navigateur.
 - Versions supportées : celles de Mineflayer (1.8 → 1.21.x, 1.21.10 inclus).

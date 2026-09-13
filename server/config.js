@@ -71,7 +71,13 @@ const config = {
   // synchronously on the event loop; this keeps the bot responsive.
   drainBudgetMs: intFromEnv('DRAIN_BUDGET_MS', 8),
   // Compact binary chunks are deflated before being sent.
-  chunkCompression: process.env.CHUNK_COMPRESSION !== '0'
+  chunkCompression: process.env.CHUNK_COMPRESSION !== '0',
+
+  // ---- Security (V1.1.3) ----
+  // Allow `connect` requests pointing at private/internal addresses
+  // (127.0.0.1, 192.168.x.x...). ONLY for local development — on a public
+  // box this turns the bot relay into an SSRF pivot into your LAN.
+  allowPrivateServers: process.env.ALLOW_PRIVATE_SERVERS === '1'
 }
 
 function intFromEnv (name, fallback) {

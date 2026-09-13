@@ -590,7 +590,10 @@ const HUD_SPRITES = [
   ['heart_half', 'textures/gui/sprites/hud/heart/half.png'],
   ['food_empty', 'textures/gui/sprites/hud/food_empty.png'],
   ['food_full', 'textures/gui/sprites/hud/food_full.png'],
-  ['food_half', 'textures/gui/sprites/hud/food_half.png']
+  ['food_half', 'textures/gui/sprites/hud/food_half.png'],
+  // V1.1.2 — vanilla hotbar chrome (182x22) + selection box (24x23)
+  ['hotbar', 'textures/gui/sprites/hud/hotbar.png'],
+  ['hotbar_selection', 'textures/gui/sprites/hud/hotbar_selection.png']
 ]
 
 function buildHudSheet (assetsDir) {
@@ -758,6 +761,63 @@ function buildDestroySheet (assetsDir) {
   }
 }
 
+/**
+ * V1.1.2 — inventory screen background. Modern packs (1.21+) ship GUI as
+ * separate sprites with no container/inventory.png, so we DRAW a vanilla-
+ * style panel: the classic #c6c6c6 grey, 3D bevel borders and 36 slot
+ * cells at the vanilla coordinates (player inventory layout).
+ * Served as /gui/inventory.png; the client overlays its item icons.
+ */
+function buildInventoryBackground (assetsDir) {
+  try {
+    // Vanilla player inventory: 176x166, 27-grid at (7,17), hotbar at (7,75)
+    const W = 176
+    const H = 166
+    const CELL = 18 // 16px sprite + 2px of panel padding around each cell
+    const img = new PNG({ width: W, height: H, colorType: 6 })
+    const put = (x, y, r, g, b, a = 255) => {
+      if (x < 0 || y < 0 || x >= W || y >= H) return
+      const i = (y * W + x) * 4
+      img.data[i] = r; img.data[i + 1] = g; img.data[i + 2] = b; img.data[i + 3] = a
+    }
+    // Panel body — vanilla grey
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        put(x, y, 198, 198, 198)
+      }
+    }
+    // Outer bevel: light top/left, dark bottom/right (vanilla GUI style)
+    for (let x = 0; x < W; x++) { put(x, 0, 255, 255, 255); put(x, H - 1, 85, 85, 85) }
+    for (let y = 0; y < H; y++) { put(0, y, 255, 255, 255); put(W - 1, y, 85, 85, 85) }
+    // Inner shadow line of the bevel
+    for (let x = 1; x < W - 1; x++) { put(x, 1, 160, 160, 160); put(x, H - 2, 232, 232, 232) }
+    for (let y = 1; y < H - 1; y++) { put(1, y, 160, 160, 160); put(W - 2, y, 232, 232, 232) }
+    // Slot cell: dark top/left inner border, light bottom/right (inset look)
+    const drawCell = (cx, cy) => {
+      for (let y = 0; y < CELL; y++) {
+        for (let x = 0; x < CELL; x++) {
+          const px = cx + x
+          const py = cy + y
+          const edge = x === 0 || y === 0
+          const edge2 = x === CELL - 1 || y === CELL - 1
+          if (edge) put(px, py, 55, 55, 55) // dark bevel
+          else if (edge2) put(px, py, 255, 255, 255) // light bevel
+          else put(px, py, 139, 139, 139) // cell interior (vanilla #8b8b8b)
+        }
+      }
+    }
+    // 27 main-grid cells (9x3) then the 9 hotbar cells — vanilla coords
+    for (let row = 0; row < 3; row++) {
+      for (let col = 0; col < 9; col++) drawCell(7 + col * CELL, 17 + row * CELL)
+    }
+    for (let col = 0; col < 9; col++) drawCell(7 + col * CELL, 75 + 0 * CELL)
+    return { png: PNG.sync.write(img), width: W, height: H }
+  } catch (e) {
+    console.warn('[resourcePack] inventory background build failed:', e.message)
+    return null
+  }
+}
+
 module.exports = {
   buildResourcePack,
   buildProceduralAtlas,
@@ -765,6 +825,7 @@ module.exports = {
   buildColormaps,
   buildItemAtlas,
   buildDestroySheet,
+  buildInventoryBackground,
   ensureResourcePack,
   findAssetsDir,
   VanillaTextureResolver,

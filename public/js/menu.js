@@ -43,26 +43,49 @@ const Menu = (() => {
     list.innerHTML = ''
     empty.classList.toggle('hidden', servers.length > 0)
 
+    // V1.1.3 — XSS-safe render: server entries come from localStorage but
+    // could be tampered with by ANY script on the page (or an old bug), so
+    // every field goes through textContent / attribute-safe construction.
+    // (The old template interpolated s.port & data-id UNESCAPED and crashed
+    // on empty names with s.name[0].)
     servers.forEach((s) => {
+      if (!s || typeof s.host !== 'string' || !s.host) return
+
       const li = document.createElement('li')
       li.className = 'server-item'
-      li.innerHTML = `
-        <div class="server-icon">${escapeHtml(s.name ? s.name[0].toUpperCase() : '?')}</div>
-        <div class="server-info">
-          <div class="server-name">${escapeHtml(s.name || s.host)}</div>
-          <div class="server-addr">${escapeHtml(s.host)}:${s.port}</div>
-        </div>
-        <button class="btn small primary connect" data-id="${s.id}">Rejoindre</button>
-        <button class="btn small danger delete" data-id="${s.id}">✕</button>
-      `
+
+      const icon = document.createElement('div')
+      icon.className = 'server-icon'
+      const initial = (typeof s.name === 'string' && s.name) ? s.name[0].toUpperCase() : '?'
+      icon.textContent = initial
+
+      const info = document.createElement('div')
+      info.className = 'server-info'
+      const nameEl = document.createElement('div')
+      nameEl.className = 'server-name'
+      nameEl.textContent = s.name || s.host
+      const addrEl = document.createElement('div')
+      addrEl.className = 'server-addr'
+      addrEl.textContent = `${s.host}:${Number(s.port) || 25565}`
+      info.appendChild(nameEl)
+      info.appendChild(addrEl)
+
+      const connect = document.createElement('button')
+      connect.className = 'btn small primary connect'
+      connect.textContent = 'Rejoindre'
+      connect.dataset.id = String(s.id || '')
+
+      const del = document.createElement('button')
+      del.className = 'btn small danger delete'
+      del.textContent = '✕'
+      del.dataset.id = String(s.id || '')
+
+      li.appendChild(icon)
+      li.appendChild(info)
+      li.appendChild(connect)
+      li.appendChild(del)
       list.appendChild(li)
     })
-  }
-
-  function escapeHtml (str) {
-    return String(str).replace(/[&<>"']/g, (c) => ({
-      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-    })[c])
   }
 
   // ------------------------------------------------------------------

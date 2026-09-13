@@ -128,6 +128,8 @@ class Renderer {
     this.worldHeight = loginMsg.worldHeight || 256
     this.renderDistance = loginMsg.renderDistance || 4
     this.entityMappings = loginMsg.entityMappings || {}
+    // V1.1.2 — vanilla-style 3D mob models (shape + parts + texture data URL)
+    this.entityModels = loginMsg.entityModels || {}
 
     // --- Scene basics --------------------------------------------------
     this.scene = new THREE.Scene()
@@ -850,12 +852,19 @@ class Renderer {
     const dims = this.entityDims(msg.name)
     const group = new THREE.Group()
 
-    const bodyColor = entityColor(msg)
-    const geometry = new THREE.BoxGeometry(dims.width, dims.height, dims.width)
-    const material = new THREE.MeshLambertMaterial({ color: bodyColor })
-    const cube = new THREE.Mesh(geometry, material)
-    cube.position.y = dims.height / 2
-    group.add(cube)
+    // V1.1.2 — vanilla-style 3D model (shape + parts + texture data URL)
+    const model = this.entityModels && this.entityModels[msg.name]
+    if (model) {
+      this.buildModeledEntity(group, model, dims)
+    } else {
+      // Fallback: the old colored box
+      const bodyColor = entityColor(msg)
+      const geometry = new THREE.BoxGeometry(dims.width, dims.height, dims.width)
+      const material = new THREE.MeshLambertMaterial({ color: bodyColor })
+      const cube = new THREE.Mesh(geometry, material)
+      cube.position.y = dims.height / 2
+      group.add(cube)
+    }
 
     // Nametag for players & mobs
     if (msg.kind === 'player' || msg.name) {
@@ -866,6 +875,81 @@ class Renderer {
       }
     }
     return group
+  }
+
+  /**
+   * V1.1.2 — builds a composite vanilla-style mob: one THREE.Group of
+   * BoxGeometry parts (head/body/arms/legs...), each UV-mapped onto the
+   * mob's texture using the vanilla 64x64 box-UV layout, then scaled so
+   * the model matches the entity's real hitbox dims (height/width).
+   */
+  buildModeledEntity (group, model, dims) {
+    const img = new Image()
+    img.src = model.texture
+    const tex = new THREE.Texture(img)
+    tex.magFilter = THREE.NearestFilter
+    tex.minFilter = THREE.NearestFilter
+    tex.colorSpace = THREE.SRGBColorSpace
+    img.onload = () => { tex.needsUpdate = true }
+    const material = new THREE.MeshLambertMaterial({ map: tex, alphaTest: 0.1 })
+
+    // Texture layout size: sent by the server (64x64 humanoid, 64x32 creeper/
+    // spider/skeleton/chicken/sheep/enderman...)
+    const TW = model.texW || 64
+    const TH = model.texH || 64
+
+    for (const part of Object.values(model.parts)) {
+      const [w, h, d] = part.size
+      const geo = new THREE.BoxGeometry(w / 16, h / 16, d / 16)
+      // Vanilla box UV: each face gets its own rectangle on the texture.
+      // THREE BoxGeometry face order: +X, -X, +Y, -Y, +Z, -Z (4 uv each).
+      const uv = geo.attributes.uv
+      const U = part.uv[0]
+      const V = part.uv[1]
+      // Vanilla box-UV layout (u,v = top-left of the part's UV area):
+      //   top:   [u+d,     v]       .. [u+d+w,     v+d]
+      //   bottom:[u+d+w,   v]       .. [u+d+w+w,  v+d]
+      //   west(-X): [u,       v+d]   .. [u+d,       v+d+h]
+      //   north(-Z): [u+d,     v+d]   .. [u+d+w,     v+d+h]
+      //   east(+X):  [u+d+w,  v+d]   .. [u+d+w+d,   v+d+h]
+      //   south(+Z): [u+d+w+d,v+d]   .. [u+d+w+d+w, v+d+h]
+      const px = (x) => x / TW
+      const py = (y) => 1 - y / TH
+      const rects = [
+        [U + d + w, V + d, U + d + w + d, V + d + h], // +X = east
+        [U, V + d, U + d, V + d + h], // -X = west
+        [U + d, V, U + d + w, V + d], // +Y = top
+        [U + d + w, V, U + d + w + w, V + d], // -Y = bottom
+        [U + d + w + d, V + d, U + d + w + d + w, V + d + h], // +Z = south
+        [U + d, V + d, U + d + w, V + d + h] // -Z = north
+      ]
+      for (let f = 0; f < 6; f++) {
+        const [u0, v0, u1, v1] = rects[f]
+        // Bottom row of the face = bottom of the texture rect (v1)
+        uv.setXY(f * 4 + 0, px(u0), py(v1)) // bottom-left
+        uv.setXY(f * 4 + 1, px(u1), py(v1)) // bottom-right
+        uv.setXY(f * 4 + 2, px(u0), py(v0)) // top-left
+        uv.setXY(f * 4 + 3, px(u1), py(v0)) // top-right
+      }
+      const mesh = new THREE.Mesh(geo, material)
+      // Pivot = the CENTER of the box (see entityModels.js) — direct mapping
+      mesh.position.set(part.pivot[0] / 16, part.pivot[1] / 16, part.pivot[2] / 16)
+      group.add(mesh)
+    }
+
+    // Scale the model to the entity's real hitbox: our humanoid is 32px tall
+    // (2 blocks); quadruped 24px (1.5); enderman 42px... compute from the
+    // highest part pivot+size so every shape auto-fits its hitbox height.
+    let maxTop = 0
+    for (const part of Object.values(model.parts)) {
+      maxTop = Math.max(maxTop, part.pivot[1] + part.size[1])
+    }
+    // The model's top in blocks; scale = hitbox height / model height
+    const modelHeightBlocks = maxTop / 16
+    const scale = dims.height / modelHeightBlocks
+    group.scale.setScalar(scale)
+    // Parts pivot from the FEET (y=0) — the group is placed at the entity's
+    // position (feet), exactly how the server reports it.
   }
 
   makeNametag (text) {

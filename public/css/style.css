@@ -286,6 +286,15 @@ input:focus { border-color: var(--accent); }
   grid-template-columns: repeat(9, 46px);
   gap: 4px;
 }
+/* Vanilla-textured mode (V1.1.2): slots are absolutely positioned over the
+   /gui/inventory.png background — the grids become plain containers. */
+#inventory-panel.textured #inventory-grid,
+#inventory-panel.textured #inventory-hotbar {
+  display: block;
+  position: static;
+  height: 0;
+  overflow: visible;
+}
 .inv-slot {
   position: relative;
   width: 46px; height: 46px;
@@ -293,6 +302,7 @@ input:focus { border-color: var(--accent); }
   border: 2px solid #555;
   border-radius: 4px;
   cursor: pointer;
+  box-sizing: border-box;
 }
 .inv-slot:hover { border-color: #aaa; }
 .inv-slot.picked {

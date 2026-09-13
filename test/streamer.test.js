@@ -35,16 +35,29 @@ const stone = mcData.blocksByName.stone
 const grass = mcData.blocksByName.grass_block
 const dirt = mcData.blocksByName.dirt
 const air = mcData.blocksByName.air
+// plains: a real biome with temperature/downfall for the colormap sampling
+const plains = mcData.biomesArray.find((b) => b.name === 'plains')
 
 for (let x = 0; x < 16; x++) {
   for (let z = 0; z < 16; z++) {
-    column.setBlock({ x, y: minY, z }, { stateId: bedrock.defaultState, biome: 1 })
+    column.setBlock({ x, y: minY, z }, { stateId: bedrock.defaultState })
     for (let y = minY + 1; y < 20; y++) {
-      column.setBlock({ x, y, z }, { stateId: stone.defaultState, biome: 1 })
+      column.setBlock({ x, y, z }, { stateId: stone.defaultState })
     }
-    column.setBlock({ x, y: 20, z }, { stateId: dirt.defaultState, biome: 1 })
-    column.setBlock({ x, y: 21, z }, { stateId: grass.defaultState, biome: 1 })
+    column.setBlock({ x, y: 20, z }, { stateId: dirt.defaultState })
+    column.setBlock({ x, y: 21, z }, { stateId: grass.defaultState })
+    // setBlock's biome option takes an OBJECT ({id}) — a raw number was
+    // silently ignored, leaving biome undefined and the tint at 0 (gray
+    // grass bug). setBiome is the explicit path.
+    column.setBiome({ x, y: 21, z }, plains.id)
     // air above stays implicit
+  }
+}
+// Non-grass layers get a biome too (the streamer samples the biome at every
+// block position; without one the section defaults to 0 = badlands).
+for (let x = 0; x < 16; x++) {
+  for (let z = 0; z < 16; z++) {
+    for (let y = minY; y <= 20; y++) column.setBiome({ x, y, z }, plains.id)
   }
 }
 
@@ -56,7 +69,16 @@ const fakeBot = {
   }
 }
 
+// Vanilla-like grass colormap: every pixel plain green (80,190,70).
+// _colormapSample reads it at the biome's (temperature, downfall).
+const { PNG } = require('pngjs')
+const grassColormap = new PNG({ width: 256, height: 256 })
+for (let i = 0; i < grassColormap.data.length; i += 4) {
+  grassColormap.data[i] = 80; grassColormap.data[i + 1] = 190
+  grassColormap.data[i + 2] = 70; grassColormap.data[i + 3] = 255
+}
 const streamer = new WorldStreamer({ bot: fakeBot, mcData, renderDistance: 4 })
+streamer.colormaps = { grass: grassColormap, foliage: grassColormap }
 
 // --- Serialize ------------------------------------------------------------
 const payload = streamer.serializeChunk(0, 0)
@@ -108,6 +130,27 @@ for (let i = 0; i < blocks.length; i++) {
   assert.strictEqual(a.blockId, b.blockId); assert.strictEqual(a.faceMask, b.faceMask)
 }
 console.log('✓ client codec output === manual raw decode (every field, every entry)')
+
+// --- Biome tint (V1.1.2 gray-grass regression test) -------------------------
+// The grass layer must carry a NON-ZERO tint sampled from the (green) grass
+// colormap. A zero tint = gray grass — the exact V1.1.0/V1.1.1 bug, caused by
+// _buildStateLookup rejecting minecraft-data's OBJECT-shaped blocksByStateId
+// (only arrays were accepted, so the tint table stayed empty).
+{
+  const grassEntries = decoded.entries.filter((e) => e.blockId === grass.id)
+  assert(grassEntries.length > 0, 'grass entries present')
+  const tinted = grassEntries.filter((e) => e.tint !== 0 && e.tint !== undefined)
+  assert.strictEqual(tinted.length, grassEntries.length, 'every grass entry carries a biome tint')
+  // Decode one tint: RGB565 -> RGB, expect the colormap's green (~80,188,64)
+  const t = tinted[0].tint
+  const r = ((t >> 11) & 0x1f) << 3
+  const g = ((t >> 5) & 0x3f) << 2
+  const b = (t & 0x1f) << 3
+  assert(r >= 60 && r <= 100, `tint red channel in range (got ${r})`)
+  assert(g >= 150 && g <= 210, `tint green channel dominant (got ${g})`)
+  assert(b <= 100, `tint blue channel low (got ${b})`)
+  console.log(`✓ grass biome tint: RGB(${r},${g},${b}) — green, not gray`)
+}
 
 // The grass block layer (y=21 local y=21-minY) must be visible with the top
 // face (+Y bit 4) set; blocks below it hidden (faceMask without top bit)

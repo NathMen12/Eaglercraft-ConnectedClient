@@ -16,6 +16,8 @@ const { WebSocketServer, WebSocket } = require('ws')
 const config = require('./config')
 const { BotManager } = require('./botManager')
 const resourcePack = require('./resourcePack')
+const { buildEntityModels } = require('./entityModels')
+const { assertPublicHost, createRateLimiter, securityHeaders } = require('./security')
 
 // ---------------------------------------------------------------------------
 // HTTP server (static files + texture atlas)
@@ -23,6 +25,8 @@ const resourcePack = require('./resourcePack')
 
 const app = express()
 app.disable('x-powered-by')
+// V1.1.3 — baseline security headers on EVERY response (nosniff, CSP, ...)
+app.use(securityHeaders)
 // Serve the web client
 app.use(express.static(path.join(__dirname, '..', 'public')))
 // Serve three.js from node_modules (imported by renderer.js as an ES module).
@@ -68,18 +72,27 @@ let colormaps = null
 let itemAtlas = null
 // Destroy-stage crack sheet (V1.1.1 mining overlay) — built during boot.
 let destroySheet = null
+// V1.1.2 — inventory screen background (vanilla container texture)
+let inventoryBg = null
+// V1.1.2 — 3D entity models (vanilla-style composite shapes + textures)
+let entityModels = null
 bootPromise.then(() => {
   if (!config.resourcePackPath) return
   try {
     const assetsDir = resourcePack.findAssetsDir(config.resourcePackPath)
     if (!assetsDir) return
     hudSheet = resourcePack.buildHudSheet(assetsDir)
-    if (hudSheet) console.log(`[resourcePack] HUD sheet built (${Object.keys(hudSheet.sprites).filter(k => hudSheet.sprites[k]).length}/6 sprites)`)
+    if (hudSheet) console.log(`[resourcePack] HUD sheet built (${Object.keys(hudSheet.sprites).filter(k => hudSheet.sprites[k]).length} sprites)`)
     colormaps = resourcePack.buildColormaps(assetsDir)
     if (colormaps) console.log('[resourcePack] biome colormaps loaded (grass + foliage)')
     itemAtlas = resourcePack.buildItemAtlas(assetsDir, '1.21.9')
     destroySheet = resourcePack.buildDestroySheet(assetsDir)
     if (destroySheet) console.log(`[resourcePack] destroy sheet built (${destroySheet.tiles} stages)`)
+    inventoryBg = resourcePack.buildInventoryBackground(assetsDir)
+    entityModels = buildEntityModels(assetsDir)
+    if (entityModels && Object.keys(entityModels).length > 0) {
+      console.log(`[entityModels] built: ${Object.keys(entityModels).length} mobs (zombie, creeper, skeleton, pig, cow...)`)
+    }
   } catch (e) {
     console.warn('[resourcePack] HUD sheet build failed:', e.message)
   }
@@ -116,6 +129,13 @@ app.get('/destroy.png', (req, res) => {
   res.set('Cache-Control', 'public, max-age=86400')
   res.send(destroySheet.png)
 })
+// V1.1.2 — inventory screen background (vanilla container texture)
+app.get('/gui/inventory.png', (req, res) => {
+  if (!inventoryBg) { res.status(404).end(); return }
+  res.set('Content-Type', 'image/png')
+  res.set('Cache-Control', 'public, max-age=86400')
+  res.send(inventoryBg.png)
+})
 app.get('/items.json', (req, res) => {
   res.set('Content-Type', 'application/json')
   res.set('Cache-Control', 'public, max-age=86400')
@@ -129,16 +149,27 @@ app.get('/items.json', (req, res) => {
 // Minecraft version (block ids differ across versions); the client requests
 // it after login when it knows the negotiated version.
 const blocksJsonCache = new Map() // version -> JSON string
+// V1.1.3 — query cache poisoning fix: validate the version key BEFORE using
+// it (arbitrary strings used to be require()d & cached forever — a memory
+// exhaustion vector) and cap the cache size.
+const MC_VERSION_RE = /^\d+\.\d+(\.\d+)?(pre|rc)?\d*$/
 app.get('/blocks.json', (req, res) => {
   const version = String(req.query.v || '1.21.9')
+  if (!MC_VERSION_RE.test(version) || version.length > 16) {
+    res.status(400).json({ error: 'invalid version' })
+    return
+  }
   let payload = blocksJsonCache.get(version)
   if (!payload) {
     const mcData = require('minecraft-data')(version)
-    const table = {}
-    if (mcData) {
-      for (const b of mcData.blocksArray) table[b.id] = b.name
+    if (!mcData) {
+      res.status(404).json({ error: 'unknown version' })
+      return
     }
+    const table = {}
+    for (const b of mcData.blocksArray) table[b.id] = b.name
     payload = JSON.stringify(table)
+    if (blocksJsonCache.size > 64) blocksJsonCache.clear() // bounded memory
     blocksJsonCache.set(version, payload)
   }
   res.set('Content-Type', 'application/json')
@@ -152,7 +183,13 @@ const server = http.createServer(app)
 // WebSocket server
 // ---------------------------------------------------------------------------
 
-const wss = new WebSocketServer({ server, path: '/ws' })
+// V1.1.3 — hardening:
+//   maxPayload: client messages are tiny JSON (<1 KB); the ws default (512
+//     MB!) let ONE socket OOM the whole server.
+//   Origin check: a browser page from another site could open a /ws socket
+//     (CSWSH) and drive the bot as the victim — only same-origin pages may.
+const MAX_WS_PAYLOAD = 64 * 1024
+const wss = new WebSocketServer({ server, path: '/ws', maxPayload: MAX_WS_PAYLOAD })
 
 const manager = new BotManager(config)
 manager.on('log', (msg) => console.log(`[botManager] ${msg}`))
@@ -168,17 +205,43 @@ function sendBinary (ws, buf) {
 // Keep track of socket ids
 let nextSocketId = 1
 
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
+  // V1.1.3 — CSWSH guard: reject cross-site WebSocket handshakes. The web
+  // client is served from this very server, so any other Origin is hostile.
+  const origin = req.headers.origin
+  if (origin) {
+    let host = ''
+    try { host = new URL(origin).host } catch (e) {}
+    if (host !== req.headers.host) {
+      ws.close(1008, 'cross-origin WebSocket rejected')
+      return
+    }
+  }
   ws.id = `sock-${nextSocketId++}`
   ws.isAlive = true
+  // V1.1.3 — per-socket rate limit: bursts up to 60, refilled at 30/s. The
+  // legit client peaks at ~25 msg/s (look 20 Hz + controls + chat).
+  ws.rateLimiter = createRateLimiter(60, 30)
   ws.on('pong', () => { ws.isAlive = true })
 
   sendJson(ws, { t: 'hello', maxConcurrentBots: config.maxConcurrentBots, queueSize: 0 })
 
   ws.on('message', (data, isBinary) => {
     if (isBinary) return // clients only send text
+    // V1.1.3 — size + rate guards before ANY parsing
+    if (data.length > MAX_WS_PAYLOAD) return
+    if (!ws.rateLimiter.take()) {
+      // Only warn once per burst to avoid a feedback loop of error messages
+      if (!ws.rateLimited) {
+        ws.rateLimited = true
+        sendJson(ws, { t: 'rate_limited' })
+        setTimeout(() => { try { ws.rateLimited = false } catch (e) {} }, 5000)
+      }
+      return
+    }
     let msg
     try { msg = JSON.parse(data.toString()) } catch (e) { return }
+    if (!msg || typeof msg !== 'object' || Array.isArray(msg)) return
 
     switch (msg.t) {
       case 'connect':
@@ -245,13 +308,16 @@ function validateConnectRequest (msg) {
   const host = String(msg.host || '').trim()
   const port = parseInt(msg.port, 10) || 25565
   const username = String(msg.username || '').trim()
+  // V1.1.3 — host: hostname or literal IP only (no userinfo/paths/schemes:
+  // 'http://x', 'user@host' or 'host:80:90' are rejected outright)
   if (!host || host.length > 255) return { error: 'Invalid host' }
+  if (!/^[a-zA-Z0-9._-]+$/.test(host)) return { error: 'Invalid host (letters, digits, . _ - only)' }
   if (!Number.isInteger(port) || port < 1 || port > 65535) return { error: 'Invalid port' }
   if (!/^[a-zA-Z0-9_]{1,16}$/.test(username)) return { error: 'Invalid username (1-16 alphanumeric/underscore)' }
   return { host, port, username }
 }
 
-function handleConnect (ws, msg) {
+async function handleConnect (ws, msg) {
   const valid = validateConnectRequest(msg)
   if (valid.error) {
     sendJson(ws, { t: 'connect_error', error: valid.error })
@@ -261,6 +327,17 @@ function handleConnect (ws, msg) {
   if (manager.sessions.has(ws.id)) {
     sendJson(ws, { t: 'connect_error', error: 'Already connected — disconnect first' })
     return
+  }
+  // V1.1.3 — SSRF guard: the bot relay must only reach PUBLIC Minecraft
+  // servers. Without this, any web client could point the server at
+  // 127.0.0.1:22, the AWS metadata IP, or an internal admin panel and use
+  // the bot as a network pivot. (ALLOW_PRIVATE_SERVERS=1 for local dev.)
+  if (!config.allowPrivateServers) {
+    const ssrf = await assertPublicHost(valid.host)
+    if (ssrf) {
+      sendJson(ws, { t: 'connect_error', error: `Blocked: ${ssrf.error}` })
+      return
+    }
   }
   manager.requestConnect(ws, valid)
 }
@@ -421,10 +498,16 @@ function handleActivate (ws, msg) {
 // Inventory (hotbar) relays — V1.1.0
 // ---------------------------------------------------------------------------
 
-/** Serializes an inventory item (null when the slot is empty). */
+/** Serializes an inventory item (null when the slot is empty).
+ *  V1.1.3 — item names are UNTRUSTED (they come from the target Minecraft
+ *  server): bound + charset-checked before being relayed to the browser
+ *  (the client sanitizes again — defense in depth). */
 function serializeItem (item) {
   if (!item) return null
-  return { name: item.name, count: item.count }
+  const name = String(item.name || '').slice(0, 64)
+  if (!/^[a-z0-9_]{1,64}$/.test(name)) return null
+  const count = Number(item.count)
+  return { name, count: Number.isFinite(count) && count > 0 ? Math.min(Math.floor(count), 65535) : 1 }
 }
 
 /** Hotbar snapshot: the 9 quick-bar slots + the selected one. */
@@ -527,7 +610,9 @@ manager.on('botReady', async (socket, session, mcData) => {
     minY: bot.game ? bot.game.minY : 0,
     worldHeight: bot.game ? (bot.game.height || 256) : 256,
     renderDistance: config.renderDistance,
-    entityMappings: buildEntityMappings(mcData)
+    entityMappings: buildEntityMappings(mcData),
+    // V1.1.2 — vanilla-style 3D mob models (shape + parts + texture data URL)
+    entityModels: entityModels || {}
   })
 
   attachWorldStreaming(socket, session, mcData)
@@ -792,15 +877,19 @@ function attachBotEvents (socket, session) {
   session.cleanup.push(() => bot.off('health', onHealth))
 
   // --- Chat ----------------------------------------------------------------
+  // V1.1.3 — chat content is UNTRUSTED (target MC server): bound before
+  // being relayed (the client truncates again — defense in depth).
   const onChat = (username, message) => {
-    sendJson(socket, { t: 'chat', from: username, text: message })
+    const from = typeof username === 'string' ? username.slice(0, 64) : null
+    const text = String(message || '').slice(0, 512)
+    if (text) sendJson(socket, { t: 'chat', from, text })
   }
   bot.on('chat', onChat)
   session.cleanup.push(() => bot.off('chat', onChat))
 
   const onMessage = (jsonMsg) => {
     // Full system messages (join/leave, deaths, /say...)
-    const text = jsonMsg.toString()
+    const text = jsonMsg.toString().slice(0, 512) // V1.1.3 — bounded
     if (text) sendJson(socket, { t: 'chat', from: null, text })
   }
   bot.on('message', onMessage)
@@ -823,12 +912,15 @@ function attachBotEvents (socket, session) {
 
   const sendEntity = (entity, isNew) => {
     if (!entity) return
+    // V1.1.3 — entity names are UNTRUSTED (target MC server); they land in
+    // canvas nametags (safe) but are bounded anyway.
+    const name = String(entity.name || entity.username || entity.type || '').slice(0, 64)
     sendJson(socket, {
       t: 'entity',
       isNew,
       id: entity.id,
-      kind: entity.type,
-      name: entity.name || entity.username || entity.type,
+      kind: String(entity.type || '').slice(0, 64),
+      name,
       x: entity.position.x, y: entity.position.y, z: entity.position.z,
       yaw: entity.yaw, pitch: entity.pitch
     })
@@ -838,7 +930,7 @@ function attachBotEvents (socket, session) {
     if (!e || e === bot.entity) return
     pendingEntityUpdates.set(e.id, {
       id: e.id,
-      name: e.name || e.username || e.type,
+      name: String(e.name || e.username || e.type || '').slice(0, 64),
       x: e.position.x, y: e.position.y, z: e.position.z,
       yaw: e.yaw
     })

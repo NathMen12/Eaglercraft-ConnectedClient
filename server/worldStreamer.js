@@ -195,9 +195,16 @@ class WorldStreamer {
 
   /** Precomputes stateId -> blockId / skip / exposed / tint tables. */
   _buildStateLookup () {
-    const byState = this.mcData.blocksByStateId
-    if (!Array.isArray(byState) || byState.length === 0) return
-    const n = byState.length
+    let byState = this.mcData.blocksByStateId
+    if (!byState) return
+    // minecraft-data exposes blocksByStateId as an ARRAY on some versions
+    // and as an OBJECT (stateId-as-string keys) on others — both are
+    // numerically indexed, so normalize the length only. (When it is an
+    // object, the old Array.isArray check returned early and the tint /
+    // id tables were NEVER built — grass rendered gray because
+    // _stateToTint stayed empty!)
+    const n = Array.isArray(byState) ? byState.length : Object.keys(byState).length
+    if (n === 0) return
     const ids = new Int32Array(n) // 0 = air/not present
     const skipped = new Uint8Array(n)
     const exposed = new Uint8Array(n)
