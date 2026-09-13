@@ -102,14 +102,22 @@ function sectionDescriptor (section) {
 /** Flattens a section descriptor into out (Uint32Array[4096] of stateIds). */
 function flattenSection (desc, out) {
   if (desc.single !== undefined) { out.fill(desc.single); return }
-  const { raw, bpv, mask, palette, noSpan } = desc
+  const { raw, bpv, vpl, mask, palette, noSpan } = desc
   let i = 0
   if (noSpan) {
-    // [low, high] 32-bit word pairs per 64-bit long; values never span a long
+    // [low, high] 32-bit word pairs per 64-bit long; values never span a long.
+    // V1.2.0 CRITICAL FIX: BitArrayNoSpan stores only valuesPerLong values
+    // per 64-bit long — the remaining bits are PADDING and must never be
+    // read. The old loop ran `off < 64` and read the padding, shifting every
+    // following value by +1 per long: with bpv=5+ (17+ block types in the
+    // section palette — any rich surface), 97% of the flattened values were
+    // wrong, producing the "diagonal dirt/stone staircases" and phantom
+    // blocks (deterministic, so the R reload changed nothing).
+    const dataBits = vpl * bpv // valid data region within each long
     for (let w = 0; w < raw.length && i < SECTION_VOLUME; w += 2) {
       const w0 = raw[w]
       const w1 = raw[w + 1]
-      for (let off = 0; off < 64 && i < SECTION_VOLUME; off += bpv) {
+      for (let off = 0; off < dataBits && i < SECTION_VOLUME; off += bpv) {
         let v
         if (off >= 32) {
           v = (w1 >>> (off - 32)) & mask
@@ -346,6 +354,11 @@ class WorldStreamer {
     const sections = Array.isArray(column.sections) ? column.sections : null
     const sectionBase = minY >> 4 // index of the section holding minY
     const sectionCount = maxY >> 4
+
+    // STREAMER_SLOW=1 escape hatch (V1.2.0): forces the generic
+    // getBlockStateId path — the safe reference implementation. Only for
+    // debugging section-layout issues on exotic server versions.
+    if (process.env.STREAMER_SLOW === '1') sections = null
 
     // Fast path: flatten every non-empty section into a pooled
     // Uint32Array[4096] of stateIds (sequential inline bit extraction —

@@ -168,8 +168,11 @@ class Renderer {
     this.atlasPixelSize = this.atlasGrid * this.tileSize
 
     window.addEventListener('resize', () => this.onResize())
-    // V1.1.1 — first-person hand + mining crack overlay
+    // V1.2.0 — pre-load the item atlas (dropped items + hand fallbacks use
+    // it synchronously) + first-person hand + mining crack overlay
+    this.ensureItemAtlas().then((atlas) => { this.itemAtlasInfoSync = atlas })
     this.initHandScene()
+    this.initLocalPlayerModel() // V1.2.0 — F5 third person
     this.loadOverlays() // async; the overlay just stays absent on 404
     this.ready = true
     this.startLoop()
@@ -478,6 +481,41 @@ class Renderer {
     return !!(this.blockMappings && this.blockMappings[name])
   }
 
+  // ------------------------------------------------------------------
+  // V1.2.0 — Entity targeting (attack) + third-person camera (F5)
+  // ------------------------------------------------------------------
+
+  /**
+   * Raycasts the visible entities along the camera look, closest first.
+   * The check is a segment/sphere test against each entity's rendering
+   * bounds (its interpolated position + its height/width). Returns
+   * { id, name, dist } or null. Range: vanilla survival attack reach.
+   */
+  raycastEntities (maxDistance = 3.5) {
+    if (!this.camera || this.entities.size === 0) return null
+    const origin = this.camera.position
+    const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion)
+    let best = null
+    for (const [id, group] of this.entities) {
+      const d = group.userData.dims || { height: 1.8, width: 0.6 }
+      // Sphere centre at mid-height of the entity's current (interpolated) pos
+      const cx = group.position.x
+      const cy = group.position.y + d.height / 2
+      const cz = group.position.z
+      const ox = cx - origin.x; const oy = cy - origin.y; const oz = cz - origin.z
+      const radius = Math.max(d.width, d.height * 0.45) / 2 + 0.15 // hitbox + leeway
+      // Project the centre on the ray; reject entities behind the camera
+      const t = ox * dir.x + oy * dir.y + oz * dir.z
+      if (t < 0 || t > maxDistance) continue
+      const px = origin.x + dir.x * t; const py = origin.y + dir.y * t; const pz = origin.z + dir.z * t
+      const distSq = (px - cx) * (px - cx) + (py - cy) * (py - cy) + (pz - cz) * (pz - cz)
+      if (distSq <= radius * radius) {
+        if (!best || t < best.dist) best = { id, name: group.userData.name || null, dist: t }
+      }
+    }
+    return best
+  }
+
   /** Black wireframe box on the targeted block (vanilla-style feedback). */
   updateHighlight (target) {
     if (!this.highlightMesh) {
@@ -688,8 +726,82 @@ class Renderer {
   }
 
   // ------------------------------------------------------------------
-  // Mining crack overlay (V1.1.1) — destroy_stage_0..9 over the target
+  // V1.2.0 — Third-person camera (F5) + the local player's model
   // ------------------------------------------------------------------
+
+  /**
+   * Builds the LOCAL player's model (steve skin from the pack). Hidden in
+   * first person — shown when the camera toggles to third person (F5).
+   */
+  initLocalPlayerModel () {
+    const model = this.entityModels && this.entityModels.player
+    if (!model) return
+    const group = new THREE.Group()
+    this.buildModeledEntity(group, model, { height: 1.8, width: 0.6 })
+    // The model is built with pivot at feet: place it at the camera target.
+    group.visible = false
+    this.localPlayer = group
+    this.scene.add(group)
+  }
+
+  /** F5 toggle: 0 = first person (hand shown), 1 = third person (model shown). */
+  setThirdPerson (enabled) {
+    this.thirdPerson = !!enabled
+    if (this.localPlayer) this.localPlayer.visible = this.thirdPerson
+    // The first-person hand makes no sense in third person
+    if (this.handScene) this.handScene.visible = !this.thirdPerson
+  }
+
+  /**
+   * Per-frame third-person camera: positioned back+up from the eye along
+   * the REVERSE look, with a simple block-clip so walls push it forward.
+   * The local player model is moved to the smoothed camera target.
+   */
+  applyThirdPersonCamera (yaw, pitch, dtMs) {
+    const cam = this.camera
+    // Direction the player looks (yaw/pitch conventions as elsewhere)
+    const dirX = -Math.sin(yaw) * Math.cos(pitch)
+    const dirZ = -Math.cos(yaw) * Math.cos(pitch)
+    const dirY = Math.sin(-pitch)
+    const eye = this.camPos
+    if (!eye) return
+    const DIST = 4
+    let dist = DIST
+    // Short raycast from the eye backwards: stop at the first solid block
+    const back = { x: -dirX, y: -dirY, z: -dirZ }
+    const hit = window.VoxelRaycast
+      ? window.VoxelRaycast.raycast(
+        { x: eye.x, y: eye.y + this.eyeHeight, z: eye.z },
+        back, DIST,
+        (x, y, z) => {
+          const b = this.blockAtVoxel(x, y, z)
+          return !!(b && this.isTargetable(b.name))
+        })
+      : null
+    if (hit) {
+      // Pull in just in front of the block that blocks the view
+      dist = Math.max(0.5, Math.min(DIST, hit.dist !== undefined ? hit.dist - 0.2 : 1.5))
+    }
+    if (this.localPlayer) {
+      this.localPlayer.position.set(eye.x, eye.y, eye.z)
+      this.localPlayer.rotation.y = yaw
+      // Walk animation driven by the same swing parts mechanism
+      const swing = this.localPlayer.userData.swingParts
+      if (swing) {
+        const moved = Math.hypot(eye.x - (this._lastEyeX || eye.x), eye.z - (this._lastEyeZ || eye.z))
+        this._lastEyeX = eye.x
+        this._lastEyeZ = eye.z
+        this.localPlayer.userData.walkPhase = (this.localPlayer.userData.walkPhase || 0) + moved * 9
+        const a = Math.sin(this.localPlayer.userData.walkPhase) * 0.7 * Math.min(1, moved * 40)
+        for (const m of swing) m.rotation.x = a * m.userData.swingPhase
+      }
+    }
+    cam.position.set(
+      eye.x + back.x * dist,
+      eye.y + this.eyeHeight + back.y * dist,
+      eye.z + back.z * dist
+    )
+  }
 
   /** dig_start from the server: shows the crack overlay on (x,y,z). */
   handleDigStart (x, y, z, duration) {
@@ -813,6 +925,9 @@ class Renderer {
     if (msg.isNew) {
       const group = this.buildEntityMesh(msg)
       if (group) {
+        // V1.2.0 — keep dims/name for the entity raycast (attack targeting)
+        group.userData.dims = this.entityDims(msg.name)
+        group.userData.name = msg.name
         this.entities.set(msg.id, group)
         this.scene.add(group)
       }
@@ -829,12 +944,16 @@ class Renderer {
 
   /** Per-frame interpolation of entity positions (movement updates only
    *  arrive ~10 times per second now — without smoothing mobs teleport).
-   *  Time-based smoothing: identical feel at any fps. */
+   *  Time-based smoothing: identical feel at any fps.
+   *  V1.2.0 — also animates the walk cycle (arms/legs swing) from the
+   *  entity's actual travel speed. */
   interpolateEntities (dtMs) {
     const alpha = 1 - Math.exp(-dtMs / 80) // τ = 80 ms for mobs
     for (const group of this.entities.values()) {
       const t = group.userData.target
       if (!t) continue
+      const prevX = group.position.x
+      const prevZ = group.position.z
       group.position.x += (t.x - group.position.x) * alpha
       group.position.y += (t.y - group.position.y) * alpha
       group.position.z += (t.z - group.position.z) * alpha
@@ -845,6 +964,22 @@ class Renderer {
         while (d < -Math.PI) d += 2 * Math.PI
         group.rotation.y += d * alpha
       }
+      // V1.2.0 — walk cycle: phase advances with the distance travelled
+      const speed = Math.hypot(group.position.x - prevX, group.position.z - prevZ) / Math.max(dtMs, 1) // blocks/ms
+      const swing = group.userData.swingParts
+      if (swing && swing.length > 0) {
+        group.userData.walkPhase = (group.userData.walkPhase || 0) + speed * dtMs * 9
+        const a = Math.sin(group.userData.walkPhase) * 0.7
+        for (const m of swing) {
+          m.rotation.x = a * m.userData.swingPhase
+        }
+      }
+      // V1.2.0 — dropped items: slow spin + gentle floating (vanilla)
+      const itemSpin = group.userData.itemSpin
+      if (itemSpin) {
+        itemSpin.rotation.y += dtMs * 0.003
+        itemSpin.position.y = 0.18 + Math.sin(performance.now() * 0.003) * 0.05
+      }
     }
   }
 
@@ -852,18 +987,25 @@ class Renderer {
     const dims = this.entityDims(msg.name)
     const group = new THREE.Group()
 
-    // V1.1.2 — vanilla-style 3D model (shape + parts + texture data URL)
-    const model = this.entityModels && this.entityModels[msg.name]
-    if (model) {
-      this.buildModeledEntity(group, model, dims)
+    // V1.2.0 — dropped ITEM entities render as a textured mini-cube (the
+    // block's own tiles) or a floating sprite for non-block items.
+    if (msg.kind === 'item' || (msg.name && msg.name.startsWith('item_'))) {
+      const itemName = msg.metadata && msg.metadata.itemName ? msg.metadata.itemName : null
+      this.buildItemDropMesh(group, itemName || 'dirt', dims)
     } else {
-      // Fallback: the old colored box
-      const bodyColor = entityColor(msg)
-      const geometry = new THREE.BoxGeometry(dims.width, dims.height, dims.width)
-      const material = new THREE.MeshLambertMaterial({ color: bodyColor })
-      const cube = new THREE.Mesh(geometry, material)
-      cube.position.y = dims.height / 2
-      group.add(cube)
+      // V1.1.2 — vanilla-style 3D model (shape + parts + texture data URL)
+      const model = this.entityModels && this.entityModels[msg.name]
+      if (model) {
+        this.buildModeledEntity(group, model, dims)
+      } else {
+        // Fallback: the old colored box
+        const bodyColor = entityColor(msg)
+        const geometry = new THREE.BoxGeometry(dims.width, dims.height, dims.width)
+        const material = new THREE.MeshLambertMaterial({ color: bodyColor })
+        const cube = new THREE.Mesh(geometry, material)
+        cube.position.y = dims.height / 2
+        group.add(cube)
+      }
     }
 
     // Nametag for players & mobs
@@ -878,10 +1020,73 @@ class Renderer {
   }
 
   /**
+   * V1.2.0 — dropped item: a 0.25-block spinning cube with the block's real
+   * atlas tiles (or a flat sprite quad for tools/food). Floats sin(t).
+   */
+  buildItemDropMesh (group, itemName, dims) {
+    const info = this.blockMappings && this.blockMappings[itemName]
+    let mesh = null
+    if (info && !info.cross) {
+      // Real block: mini cube with the block's top/side tiles
+      const positions = []
+      const normals = []
+      const uvs = []
+      const indices = []
+      for (const f of FACE_DEFS) {
+        const tile = info[f.tile] !== undefined ? info[f.tile] : info.side
+        const rect = this.uvRectCached(tile)
+        const base = positions.length / 3
+        for (let ci = 0; ci < 4; ci++) {
+          const c = f.corners[ci]
+          positions.push(c.p[0] - 0.5, c.p[1] - 0.5, c.p[2] - 0.5)
+          normals.push(f.dir[0], f.dir[1], f.dir[2])
+          uvs.push(c.uv[0] === 0 ? rect.u0 : rect.u1, c.uv[1] === 0 ? rect.v0 : rect.v1)
+        }
+        indices.push(base, base + 1, base + 2, base, base + 2, base + 3)
+      }
+      const geometry = new THREE.BufferGeometry()
+      geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
+      geometry.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3))
+      geometry.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2))
+      geometry.setIndex(indices)
+      const material = new THREE.MeshLambertMaterial({ map: this.atlasTexture })
+      mesh = new THREE.Mesh(geometry, material)
+      mesh.scale.setScalar(0.25)
+    } else {
+      // Non-block item: flat sprite quad from the item atlas (or plain box)
+      const atlas = this.itemAtlasInfoSync
+      const tile = atlas && atlas.items[itemName] !== undefined ? atlas.items[itemName] : null
+      if (tile !== null && atlas) {
+        const rect = this.uvRectOnAtlas(tile, atlas.grid)
+        const geometry = new THREE.PlaneGeometry(0.35, 0.35)
+        const uv = geometry.attributes.uv
+        uv.setXY(0, rect.u0, rect.v1)
+        uv.setXY(1, rect.u1, rect.v1)
+        uv.setXY(2, rect.u0, rect.v0)
+        uv.setXY(3, rect.u1, rect.v0)
+        const material = new THREE.MeshLambertMaterial({
+          map: atlas.tex, transparent: true, alphaTest: 0.1, side: THREE.DoubleSide
+        })
+        mesh = new THREE.Mesh(geometry, material)
+        mesh.rotation.x = -0.2
+      } else {
+        const material = new THREE.MeshLambertMaterial({ color: 0xffd54a })
+        mesh = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.2, 0.2), material)
+      }
+    }
+    mesh.position.y = 0.18
+    // Spin + float handled per frame (see interpolateEntities)
+    group.userData.itemSpin = mesh
+    group.add(mesh)
+  }
+
+  /**
    * V1.1.2 — builds a composite vanilla-style mob: one THREE.Group of
    * BoxGeometry parts (head/body/arms/legs...), each UV-mapped onto the
    * mob's texture using the vanilla 64x64 box-UV layout, then scaled so
    * the model matches the entity's real hitbox dims (height/width).
+   * V1.2.0 — parts tagged `swing` are stored for the walk animation
+   * (rotate.x = sin(walkPhase) * 0.6, arms/legs in opposite phases).
    */
   buildModeledEntity (group, model, dims) {
     const img = new Image()
@@ -934,6 +1139,14 @@ class Renderer {
       const mesh = new THREE.Mesh(geo, material)
       // Pivot = the CENTER of the box (see entityModels.js) — direct mapping
       mesh.position.set(part.pivot[0] / 16, part.pivot[1] / 16, part.pivot[2] / 16)
+      if (part.swing) {
+        // V1.2.0 — walk animation: rotate around the part's TOP (pivot of a
+        // hanging limb). Store base Y + phase sign for the per-frame update.
+        mesh.userData.baseY = mesh.position.y
+        mesh.userData.swingPhase = part.swing
+        if (!group.userData.swingParts) group.userData.swingParts = []
+        group.userData.swingParts.push(mesh)
+      }
       group.add(mesh)
     }
 
@@ -1067,6 +1280,14 @@ class Renderer {
       const targetEye = this.sneaking ? 1.27 : 1.62
       this.eyeHeight += (targetEye - this.eyeHeight) * alpha
       cam.position.set(this.camPos.x, this.camPos.y + this.eyeHeight, this.camPos.z)
+      // V1.2.0 — third person (F5): camera moves back over the shoulder and
+      // the local model is shown; first person keeps the standard eye.
+      if (this.thirdPerson) {
+        this.applyThirdPersonCamera(
+          document.pointerLockElement ? this.localYaw : (this.serverYaw ?? 0),
+          document.pointerLockElement ? this.localPitch : (this.serverPitch ?? 0),
+          dtMs)
+      }
       // Sprint FOV effect (vanilla: +10% while sprinting)
       const targetFov = this.sprinting ? 77 : 70
       if (Math.abs(cam.fov - targetFov) > 0.05) {

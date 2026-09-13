@@ -1,7 +1,7 @@
 'use strict'
 
 /**
- * Eaglercraft: Connected Client — main server.
+ * Mineflayer-WebViewer — main server.
  *
  * Serves the web client (public/) over Express and speaks WebSocket (ws)
  * with browsers. For each connected web client it can spawn one Mineflayer
@@ -136,6 +136,26 @@ app.get('/gui/inventory.png', (req, res) => {
   res.set('Cache-Control', 'public, max-age=86400')
   res.send(inventoryBg.png)
 })
+
+// V1.2.0 — 3D isometric block icons for the inventory/hotbar/craft UI.
+// Rendered once from the block atlas (top + two shaded side faces), cached
+// in memory (bounded) and served as small PNGs.
+const icon3dCache = new Map() // blockName -> Buffer (png)
+app.get('/icon3d/:name.png', (req, res) => {
+  const name = String(req.params.name || '')
+  if (!/^[a-z0-9_]{1,64}$/.test(name)) { res.status(400).end(); return }
+  if (icon3dCache.size > 512) icon3dCache.clear() // bounded memory
+  let png = icon3dCache.get(name)
+  if (!png) {
+    const built = resourcePack.buildBlockIcon ? resourcePack.buildBlockIcon(name) : null
+    if (!built) { res.status(404).end(); return }
+    png = built
+    icon3dCache.set(name, png)
+  }
+  res.set('Content-Type', 'image/png')
+  res.set('Cache-Control', 'public, max-age=86400')
+  res.send(png)
+})
 app.get('/items.json', (req, res) => {
   res.set('Content-Type', 'application/json')
   res.set('Cache-Control', 'public, max-age=86400')
@@ -266,8 +286,14 @@ wss.on('connection', (ws, req) => {
         // fixes client-side phantom blocks after desyncs.
         handleResetChunks(ws)
         break
-      case 'dig':
-        handleDig(ws, msg)
+      case 'dig_start': // left click held (V1.2.0 — cancellable mining)
+        handleDigStart(ws, msg)
+        break
+      case 'dig_stop': // left click released — cancel the in-progress dig
+        handleDigStop(ws)
+        break
+      case 'attack': // left click on a MOB (V1.2.0)
+        handleAttack(ws, msg)
         break
       case 'place':
         handlePlace(ws, msg)
@@ -280,6 +306,12 @@ wss.on('connection', (ws, req) => {
         break
       case 'inv_swap': // inventory screen drag & drop (E screen)
         handleInvSwap(ws, msg)
+        break
+      case 'recipes': // V1.2.0 — craftable recipe list
+        handleRecipes(ws)
+        break
+      case 'craft': // V1.2.0 — craft { id, count }
+        handleCraft(ws, msg)
         break
       default:
         break
@@ -413,14 +445,14 @@ function handleResetChunks (ws) {
   }
 }
 
-/** Left click: mine the block at (x,y,z). One dig at a time per client —
- *  spamming the click while a dig is running would queue dozens of
- *  lookAt/dig chains and jerk the bot's camera around. The client gets a
- *  dig_start (with digTime) so it can play the crack overlay. */
-function handleDig (ws, msg) {
+/** Left click HELD (V1.2.0): starts/keeps digging the targeted block. The
+ *  client repeats dig_start while the button is down; the FIRST call starts
+ *  bot.dig(), dig_stop interrupts it (bot.stopDigging) — mining can now be
+ *  released mid-block like vanilla. */
+function handleDigStart (ws, msg) {
   const session = manager.sessions.get(ws.id)
   if (!session || !session.bot) return
-  if (session.digInFlight) return
+  if (session.digInFlight) return // already digging — the hold-repeat is expected
   const bot = session.bot
   const pos = validBlockCoords(msg)
   if (!pos) return
@@ -447,6 +479,50 @@ function handleDig (ws, msg) {
   }).finally(() => {
     session.digInFlight = false
   })
+}
+
+/** Left click RELEASED (V1.2.0): stop the in-progress dig (vanilla lets you
+ *  cancel a block mid-crack). */
+function handleDigStop (ws) {
+  const session = manager.sessions.get(ws.id)
+  if (!session || !session.bot) return
+  try { session.bot.stopDigging() } catch (e) {}
+  sendJson(ws, { t: 'dig_cancelled' })
+}
+
+/**
+ * Left click on a MOB (V1.2.0): the client raycasts entities locally and
+ * sends the target id; the server validates it exists, is in reach, and
+ * punches it (bot.attack swings + damages). Look-at is aimed first so the
+ * hit lands server-side.
+ */
+function handleAttack (ws, msg) {
+  const session = manager.sessions.get(ws.id)
+  if (!session || !session.bot) return
+  const bot = session.bot
+  const entityId = Number(msg.id)
+  if (!Number.isFinite(entityId)) return
+  const entity = bot.entities[entityId]
+  if (!entity || entity === bot.entity) {
+    sendJson(ws, { t: 'attack_error', error: 'Target not found' })
+    return
+  }
+  // Reach check (vanilla survival: 3.0 blocks; +leeway for interpolation)
+  const p = bot.entity.position
+  const e = entity.position
+  const dx = e.x - p.x; const dy = e.y - p.y; const dz = e.z - p.z
+  const distSq = dx * dx + dy * dy + dz * dz
+  if (distSq > 6.25) { // > 2.5 blocks away
+    sendJson(ws, { t: 'attack_error', error: 'Target out of reach' })
+    return
+  }
+  try {
+    bot.lookAt(e.offset(0, entity.height ? entity.height / 2 : 0.9, 0), true)
+    bot.attack(entity)
+    sendJson(ws, { t: 'attack_ok', id: entityId })
+  } catch (err) {
+    sendJson(ws, { t: 'attack_error', error: err.message || 'attack failed' })
+  }
 }
 
 /** Right click: place the held block against the (x,y,z)+face. */
@@ -492,6 +568,144 @@ function handleActivate (ws, msg) {
   } catch (e) {
     sendJson(ws, { t: 'activate_error', error: e.message || 'activate failed' })
   }
+}
+
+// ---------------------------------------------------------------------------
+// Crafting (V1.2.0)
+// ---------------------------------------------------------------------------
+
+/**
+ * Builds a serializable recipe description: what it makes, from what, and
+ * whether a crafting table is required. Ingredient counts are aggregated
+ * (a recipe asking 2x planks anywhere shows as { oak_planks: 2 }).
+ */
+function serializeRecipe (recipe) {
+  const result = recipe.result
+  const ingredients = {}
+  let requiresTable = false
+  for (const inShapeRow of (recipe.inShape || [])) {
+    if (Array.isArray(inShapeRow)) {
+      if (inShapeRow.length > 2) requiresTable = true
+      for (const cell of inShapeRow) {
+        if (cell == null) continue
+        const id = cell.id !== undefined ? cell.id : cell
+        ingredients[id] = (ingredients[id] || 0) + 1
+      }
+    } else if (inShapeRow != null) {
+      // flat shape array
+      const id = inShapeRow.id !== undefined ? inShapeRow.id : inShapeRow
+      ingredients[id] = (ingredients[id] || 0) + 1
+    }
+  }
+  if (!recipe.inShape && recipe.ingredients) {
+    for (const cell of recipe.ingredients) {
+      if (cell == null) continue
+      const id = cell.id !== undefined ? cell.id : cell
+      ingredients[id] = (ingredients[id] || 0) + 1
+      requiresTable = true // shapeless recipes are 3x3 in practice
+    }
+  }
+  if (recipe.requiresTable) requiresTable = true
+  return {
+    id: null, // assigned by the caller
+    result: { name: result.name, count: result.count },
+    ingredients, // block/item numeric ids -> count
+    requiresTable
+  }
+}
+
+/**
+ * `recipes` request: returns every recipe currently craftable from the
+ * inventory, with a stable id the client sends back on `craft`. The ids
+ * are only valid for the session's next craft (they are regenerated on
+ * every recipes request — stale ids are rejected).
+ */
+function handleRecipes (ws) {
+  const session = manager.sessions.get(ws.id)
+  if (!session || !session.bot) return
+  const bot = session.bot
+  const recipes = []
+  const seen = new Set() // one recipe per RESULT item (avoid 50x planks variants)
+  for (const item of bot.inventory.items()) {
+    // recipesFor returns what you can craft using item as an ingredient;
+    // iterating every inventory item covers the whole craftable set.
+    let list = []
+    try { list = bot.recipesFor(item.type, null, 1) } catch (e) { continue }
+    for (const r of list) {
+      if (!r.result) continue
+      const key = r.result.name
+      if (seen.has(key)) continue
+      const s = serializeRecipe(r)
+      if (!s) continue
+      seen.add(key)
+      s.id = recipes.length
+      recipes.push(s)
+      if (recipes.length >= 120) break // bounded payload
+    }
+  }
+  session.recipeCache = recipes
+  sendJson(ws, { t: 'recipes', recipes })
+}
+
+/** `craft` request: crafts { id, count } using the cached recipe list. */
+function handleCraft (ws, msg) {
+  const session = manager.sessions.get(ws.id)
+  if (!session || !session.bot) return
+  const bot = session.bot
+  const id = Math.floor(Number(msg.id))
+  const count = Math.max(1, Math.min(64, Math.floor(Number(msg.count) || 1)))
+  if (!Array.isArray(session.recipeCache) || id < 0 || id >= session.recipeCache.length) {
+    sendJson(ws, { t: 'craft_error', error: 'Unknown recipe (refresh)' })
+    return
+  }
+  // Find a crafting table within reach (4 blocks) when the recipe needs one
+  let table = null
+  const need = session.recipeCache[id].requiresTable
+  if (need) {
+    const { Vec3 } = require('vec3')
+    const p = bot.entity.position
+    outer:
+    for (let dx = -4; dx <= 4; dx++) {
+      for (let dy = -2; dy <= 2; dy++) {
+        for (let dz = -4; dz <= 4; dz++) {
+          const b = bot.blockAt(p.offset(dx, dy, dz))
+          if (b && (b.name === 'crafting_table' || b.name === 'crafting_table_old')) {
+            table = b
+            break outer
+          }
+        }
+      }
+    }
+    if (!table) {
+      sendJson(ws, { t: 'craft_error', error: 'Il faut une table de craft à proximité' })
+      return
+    }
+  }
+  // Re-resolve the recipe fresh (the cache stores our summary, not the real
+  // recipe object) then craft for real.
+  const summary = session.recipeCache[id]
+  const mcData = require('minecraft-data')(bot.version)
+  const resultBlock = mcData.blocksByName[summary.result.name]
+  const resultItem = mcData.itemsByName[summary.result.name]
+  const type = resultBlock ? resultBlock.id : resultItem ? resultItem.id : null
+  if (type == null) {
+    sendJson(ws, { t: 'craft_error', error: 'Unknown item' })
+    return
+  }
+  let candidates = []
+  try { candidates = bot.recipesFor(type, null, count, table) } catch (e) {}
+  if (!candidates || candidates.length === 0) {
+    sendJson(ws, { t: 'craft_error', error: 'Ressources insuffisantes' })
+    return
+  }
+  // Prefer the shapeless/shape recipe that needs a table only if we have one
+  const recipe = candidates.find((r) => !r.requiresTable) || candidates[0]
+  bot.craft(recipe, count, table).then(() => {
+    sendJson(ws, { t: 'craft_ok', result: summary.result.name, count })
+    // Inventory updates stream via updateSlot pushes automatically
+  }).catch((e) => {
+    sendJson(ws, { t: 'craft_error', error: e.message || 'craft failed' })
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -915,7 +1129,7 @@ function attachBotEvents (socket, session) {
     // V1.1.3 — entity names are UNTRUSTED (target MC server); they land in
     // canvas nametags (safe) but are bounded anyway.
     const name = String(entity.name || entity.username || entity.type || '').slice(0, 64)
-    sendJson(socket, {
+    const payload = {
       t: 'entity',
       isNew,
       id: entity.id,
@@ -923,7 +1137,18 @@ function attachBotEvents (socket, session) {
       name,
       x: entity.position.x, y: entity.position.y, z: entity.position.z,
       yaw: entity.yaw, pitch: entity.pitch
-    })
+    }
+    // V1.2.0 — dropped items: extract the item name from the entity's
+    // metadata slot so the client can render its real texture.
+    if (entity.metadata) {
+      const slot = entity.metadata.find((m) => m && typeof m === 'object' && (m.type === 'item_stack' || m.type === 'slot' || m.type === 5 || m.type === 6))
+      const item = slot && slot.value
+      if (item && item.name) {
+        payload.metadata = { itemName: String(item.name).slice(0, 64) }
+        payload.kind = 'item'
+      }
+    }
+    sendJson(socket, payload)
   }
   const onEntitySpawn = (e) => sendEntity(e, true)
   const onEntityMoved = (e) => {
@@ -995,7 +1220,7 @@ manager.on('error', (err) => {
 server.listen(config.port, config.host, () => {
   console.log('')
   console.log('=====================================================')
-  console.log('  Eaglercraft: Connected Client')
+  console.log('  Mineflayer-WebViewer')
   console.log('=====================================================')
   console.log(`  Web client:     http://localhost:${config.port}`)
   console.log(`  WebSocket:      ws://localhost:${config.port}/ws`)

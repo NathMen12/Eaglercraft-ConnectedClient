@@ -238,4 +238,69 @@ assert.strictEqual(inflate(fast), inflate(slow), 'fast scan (flattened sections)
 console.log('✓ fast/slow scan parity on mixed-content column (glass/torch/water/log)')
 console.log(`  payload: ${fast.length} bytes`)
 
+// --- V1.2.0 CRITICAL REGRESSION: padding in BitArrayNoSpan longs ------------
+// A rich surface section has 17+ block types in its palette => bitsPerValue 5+.
+// floor(64/5)=12 values per long, the last 4 bits are PADDING. The old
+// flattenSection read the padding, shifting every value after the first long
+// by +1 per long — 97% of the section was WRONG (the "diagonal dirt/stone
+// staircases" + phantom blocks bug; deterministic, so the R reload didn't
+// help). This test builds a 17-block-type section and checks fast === slow.
+{
+  const column3 = new ChunkColumn()
+  const minY3 = column3.minY
+  // 17 distinct block types => palette of 17+ => bpv = 5 (valuesPerLong = 12)
+  const richTypes = [
+    grass, dirt, stone,
+    mcData.blocksByName.oak_log, mcData.blocksByName.oak_leaves,
+    mcData.blocksByName.sand, mcData.blocksByName.gravel,
+    mcData.blocksByName.water, mcData.blocksByName.glass,
+    mcData.blocksByName.torch, mcData.blocksByName.crafting_table,
+    mcData.blocksByName.coal_ore, mcData.blocksByName.iron_ore,
+    mcData.blocksByName.diamond_ore, mcData.blocksByName.cobblestone,
+    mcData.blocksByName.oak_planks, mcData.blocksByName.snow_block
+  ]
+  assert(richTypes.length >= 17, 'test needs 17+ block types to force bpv=5')
+  for (let x = 0; x < 16; x++) {
+    for (let z = 0; z < 16; z++) {
+      for (let y = minY3; y < minY3 + 12; y++) {
+        // Checkerboard-ish mix so every palette index is used everywhere
+        // (localY = y - minY3 keeps the index POSITIVE — y itself is -64..)
+        const localY = y - minY3
+        const t = richTypes[(x * 3 + z * 5 + localY * 7) % richTypes.length]
+        column3.setBlock({ x, y, z }, { stateId: t.defaultState })
+        column3.setBiome({ x, y, z }, plains.id)
+      }
+    }
+  }
+  const fakeBot3 = {
+    world: {
+      getColumn: (cx, cz) => (cx === 0 && cz === 0 ? column3 : null),
+      getLoadedColumn: (cx, cz) => (cx === 0 && cz === 0 ? column3 : null)
+    }
+  }
+  const streamer3 = new WorldStreamer({ bot: fakeBot3, mcData, renderDistance: 4 })
+  streamer3.colormaps = null // tint not needed here
+  const fast3 = streamer3.serializeChunk(0, 0)
+  const wrapped3 = {
+    get minY () { return column3.minY },
+    get worldHeight () { return column3.worldHeight },
+    getBlockStateId: (pos) => column3.getBlockStateId(pos)
+  }
+  const fakeBot3Slow = {
+    world: {
+      getColumn: (cx, cz) => (cx === 0 && cz === 0 ? wrapped3 : null),
+      getLoadedColumn: (cx, cz) => (cx === 0 && cz === 0 ? wrapped3 : null)
+    }
+  }
+  const streamer3Slow = new WorldStreamer({ bot: fakeBot3Slow, mcData, renderDistance: 4 })
+  const slow3 = streamer3Slow.serializeChunk(0, 0)
+  assert(fast3 && slow3, 'rich-section: both paths produced a payload')
+  assert.strictEqual(
+    inflate(fast3), inflate(slow3),
+    'RICH SECTION (17+ palette => bpv=5, long padding) fast === slow — the diagonal-phantom-blocks regression'
+  )
+  console.log('✓ rich section (17 block types, bpv=5): fast === slow — phantom-blocks regression fixed')
+}
+
+
 console.log('\nAll streamer unit tests passed ✓')

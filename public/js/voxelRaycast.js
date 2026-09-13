@@ -51,7 +51,7 @@ const VoxelRaycast = (() => {
       // face === -1 on the first iteration: the camera's own voxel is never
       // a target (vanilla behaves the same — you can't aim at what you're in)
       if (face >= 0 && isSolid(px, py, pz)) {
-        return { x: px, y: py, z: pz, face }
+        return { x: px, y: py, z: pz, face, dist: t } // V1.2.0 — dist for camera work
       }
       // Step to the neighbour with the closest boundary crossing
       if (tMaxX < tMaxY) {

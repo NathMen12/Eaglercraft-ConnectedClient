@@ -131,25 +131,41 @@
       // V1.1.0 — R key: wipe the client cache; the server (reset_chunks)
       // wipes its own sent-set and re-streams everything from zero.
       Game.onReloadChunks(() => renderer.clearAllChunks())
-      // V1.1.0 — mouse attacks: raycast the target locally, then ask the
-      // bot to dig it / place against it (the server does its own reach check)
+      // V1.2.0 — mouse: dig (held = repeat), attack mobs, stop on release
       Game.onAttack((kind) => {
-        const target = renderer.highlight
-        if (renderer.swingHand) renderer.swingHand() // V1.1.1 — punch animation
-        if (kind === 'dig') {
-          if (!target) return
-          Net.send({ t: 'dig', x: target.x, y: target.y, z: target.z })
+        if (renderer.swingHand) renderer.swingHand()
+        if (kind === 'dig_start') {
+          // Mob in front? Punch it instead of digging (vanilla behaviour)
+          const mob = renderer.raycastEntities ? renderer.raycastEntities() : null
+          if (mob) {
+            Net.send({ t: 'attack', id: mob.id })
+            return
+          }
+          const target = renderer.highlight
+          if (target) Net.send({ t: 'dig_start', x: target.x, y: target.y, z: target.z })
+          return
+        }
+        if (kind === 'dig_stop') {
+          Net.send({ t: 'dig_stop' })
           return
         }
         // Right click — two cases:
         //   a block is targeted AND the held item can be placed -> place
         //   otherwise (no target, or a non-block item in hand) -> activate
+        const target = renderer.highlight
         const held = Game.state.hotbar[Game.state.selectedSlot]
         const heldName = held ? held.name : null
         if (target && heldName && renderer.isPlaceableItem(heldName)) {
           Net.send({ t: 'place', x: target.x, y: target.y, z: target.z, face: target.face })
         } else {
           Net.send({ t: 'activate' })
+        }
+      })
+      // V1.2.0 — F5: first <-> third person view
+      Game.onViewToggle(() => {
+        if (renderer.setThirdPerson) {
+          renderer.setThirdPerson(!renderer.thirdPerson)
+          Game.addChatLine(null, renderer.thirdPerson ? 'Vue : 3e personne' : 'Vue : 1re personne')
         }
       })
       // V1.1.1 — the hand shows the held item; re-synced on every hotbar /
@@ -275,6 +291,18 @@
       if (renderer && renderer.ready) renderer.handleDigEnd()
       Game.addChatLine(null, `⛏ ${msg.error || 'Minage impossible'}`)
     })
+    // V1.2.0 — dig cancelled (button released): hide the cracks
+    Net.on('dig_cancelled', () => {
+      if (renderer && renderer.ready) renderer.handleDigEnd()
+    })
+    // V1.2.0 — crafting feedback
+    Net.on('recipes', (msg) => Game.updateRecipes(msg))
+    Net.on('craft_ok', (msg) => {
+      Game.addChatLine(null, `✓ Crafté : ${msg.result}${msg.count > 1 ? ' x' + msg.count : ''}`)
+      if (Net.isOpen()) Net.send({ t: 'recipes' }) // refresh the list
+    })
+    Net.on('craft_error', (msg) => Game.addChatLine(null, `⚠ ${msg.error || 'Craft impossible'}`))
+    Net.on('attack_error', (msg) => Game.addChatLine(null, `⚔ ${msg.error || 'Attaque impossible'}`))
     Net.on('place_error', (msg) => Game.addChatLine(null, `⚠ ${msg.error || 'Pose impossible'}`))
     Net.on('inv_swap_error', (msg) => Game.addChatLine(null, `⚠ ${msg.error || 'Échange impossible'}`))
 
@@ -312,7 +340,10 @@
       const items = meta.items
       Game.setItemIconProvider((name) => {
         const tile = items[name]
-        return tile === undefined ? null : { url, tile }
+        if (tile !== undefined) return { url, tile }
+        // V1.2.0 — blocks that have no flat item icon get a 3D isometric
+        // one rendered by the server from the block's own textures.
+        return { url: `/icon3d/${encodeURIComponent(name)}.png`, tile: null, iso: true }
       })
       Game.renderHotbar() // re-render with textures if the hotbar was already drawn
     } catch (e) { /* no icons — the hotbar stays text-only */ }

@@ -99,12 +99,30 @@ function chickenParts () {
   }
 }
 
+/**
+ * V1.2.0 — the PLAYER model (steve layout, 64x64 skin): head + body + slim
+ * arms/legs. Used both for OTHER players and for the local bot seen in
+ * third person (F5) + the inventory preview. Parts that swing while walking
+ * are tagged `swing: 1` (arms) / `swing: -1` (legs, opposite phase).
+ */
+function playerParts () {
+  return {
+    head: { size: [8, 8, 8], pivot: [0, 28, 0], uv: [0, 0] },
+    body: { size: [8, 12, 4], pivot: [0, 18, 0], uv: [16, 16] },
+    leftArm: { size: [4, 12, 4], pivot: [-6, 22, 0], uv: [32, 48], swing: 1 },
+    rightArm: { size: [4, 12, 4], pivot: [6, 22, 0], uv: [40, 16], swing: 1 },
+    leftLeg: { size: [4, 12, 4], pivot: [-2, 6, 0], uv: [16, 48], swing: -1 },
+    rightLeg: { size: [4, 12, 4], pivot: [2, 6, 0], uv: [0, 16], swing: -1 }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Entity name -> shape + texture path
 // ---------------------------------------------------------------------------
 
 /** Texture path candidates per entity (first existing on disk wins). */
 const TEXTURE_CANDIDATES = {
+  player: ['player/wide/steve.png'], // V1.2.0 — other players + F5 self view
   zombie: ['zombie/zombie.png'],
   husk: ['zombie/husk.png'],
   drowned: ['zombie/drowned.png'],
@@ -128,6 +146,7 @@ const TEXTURE_CANDIDATES = {
 
 /** Model shape per entity name (missing names stay colored boxes). */
 const SHAPE_FOR = {
+  player: 'player', // V1.2.0 — real skin-based model for players
   zombie: 'humanoid', husk: 'humanoid', drowned: 'humanoid',
   zombie_villager: 'humanoid', skeleton: 'humanoid', stray: 'humanoid',
   wither_skeleton: 'humanoid', bogged: 'humanoid', villager: 'humanoid',
@@ -142,6 +161,7 @@ const SHAPE_FOR = {
 }
 
 const PARTS_FOR = {
+  player: () => playerParts(), // V1.2.0
   humanoid: () => humanoidParts(),
   creeper: () => creeperParts(),
   quadruped: () => quadrupedParts(),
@@ -201,5 +221,5 @@ function buildEntityModels (assetsDir) {
 module.exports = {
   buildEntityModels, SHAPE_FOR, TEXTURE_CANDIDATES,
   humanoidParts, creeperParts, quadrupedParts, spiderParts,
-  endermanParts, chickenParts
+  endermanParts, chickenParts, playerParts
 }

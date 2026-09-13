@@ -35,10 +35,15 @@ La page passe au rendu 3D dès que le bot est connecté.
 | `Clic gauche` | Miner le bloc visé (contour noir = ciblage, fissures = progression) |
 | `Clic droit` | Poser le bloc tenu contre la face visée / utiliser l'item |
 | `Molette` / `1`-`9` | Sélectionner un slot de la hotbar (chrome + sélection vanilla) |
-| `E` | **Inventaire** — panneau vanilla 3x (grille 27 + hotbar), déplace les items par 2 clics |
+| `E` | **Inventaire** — panneau vanilla 3x (grille 27 + hotbar) + **onglet Craft** (V1.2.0), déplace les items par 2 clics |
 | `R` | **Recharger les chunks** — vide le cache client (meshes + données) et le set serveur, puis re-scanne tout depuis zéro (fix des blocs fantômes) |
+| `F5` | **Changer de vue** — 1re ⇄ 3e personne (V1.2.0 : le perso steve animé devient visible) |
 | `Échap` | Relâcher la souris (stoppe le mouvement) |
 | `T` ou `/` | Ouvrir le chat (`Entrée` envoie, `Échap` annule) |
+
+**Minage continu (V1.2.0)** : maintenir le clic gauche enchaîne les blocs comme vanilla ;
+relâcher **annule** le minage en cours (fissures retirées, `bot.stopDigging`). Un clic gauche
+sur un **mob** le frappe (`bot.attack`) — portée 2.5 blocs.
 
 ## Configuration (variables d'environnement)
 
@@ -201,9 +206,15 @@ node test/e2e.js [host] [port]  # bout-en-bout contre un serveur Minecraft
 
 - Connexion **offline-mode** uniquement (pas d'auth Mojang).
 - Mobs rendus avec des **modèles 3D style vanilla** (zombie, creeper, skeleton,
-  spider, enderman, pig, cow, sheep, chicken, villager… 19 mobs) — les autres
-  entités restent des boîtes colorées. Pas d'animation de marche pour l'instant.
+  spider, enderman, pig, cow, sheep, chicken, villager… 19 mobs + **joueur steve**
+  en vue 3e personne) — les autres entités restent des boîtes colorées. Animation
+  de marche des membres (bras/jambes en opposition de phase).
 - Inventaire : déplacement d'items par paires de clics (pas de drag & drop continu),
-  pas d'armure/craft — v1.3. Le minage affiche les fissures vanilla côté client.
+  pas d'armure — v1.3. Le minage affiche les fissures vanilla et **peut être
+  annulé** en relâchant le clic.
+- Craft (V1.2.0) : recettes automatiques via `bot.recipesFor` (l'inventaire
+  suffit ; les recettes 3x3 demandent une table à ≤4 blocs, auto-détectée).
+- Icônes des blocs : rendu **isométrique 3D** serveur (`/icon3d/nom.png`, tint
+  biome plains pour l'herbe/feuilles) — fallback atlas d'items.
 - Un bot par onglet navigateur.
 - Versions supportées : celles de Mineflayer (1.8 → 1.21.x, 1.21.10 inclus).

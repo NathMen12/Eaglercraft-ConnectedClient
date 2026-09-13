@@ -49,6 +49,31 @@ const Game = (() => {
   }
 
   /**
+   * V1.2.0 — applies an icon from getItemIcon() onto an element as a CSS
+   * background. Two shapes:
+   *   { url, tile }        -> tile of the shared 64x64 item atlas sheet
+   *   { url, tile: null, iso: true } -> standalone 3D isometric PNG (/icon3d)
+   * `px` is the icon's display size (hotbar / inventory / craft all differ).
+   */
+  function applyItemIcon (el, name, px) {
+    const info = getItemIcon(name)
+    if (!info || !el) return false
+    if (info.iso && info.tile == null) {
+      el.style.backgroundImage = `url(${info.url})`
+      el.style.backgroundPosition = 'center'
+      el.style.backgroundSize = 'contain'
+      el.style.backgroundRepeat = 'no-repeat'
+    } else if (info.tile != null) {
+      const tx = (info.tile % 64) * px
+      const ty = Math.floor(info.tile / 64) * px
+      el.style.backgroundImage = `url(${info.url})`
+      el.style.backgroundPosition = `-${tx}px -${ty}px`
+      el.style.backgroundSize = `${64 * px}px ${64 * px}px`
+    }
+    return true
+  }
+
+  /**
    * Hotbar selection. notifyServer=false when the change originates from a
    * server echo (slot_selected) — pushing it back would loop.
    */
@@ -91,6 +116,10 @@ const Game = (() => {
   // provided by the renderer (block + face) via onAttack callback.
   let attackCallback = null
   function onAttack (fn) { attackCallback = fn }
+
+  // V1.2.0 — F5 view toggle (first <-> third person), wired in main.js.
+  let viewToggleCallback = null
+  function onViewToggle (fn) { viewToggleCallback = fn }
 
   // Sneak/sprint state callbacks: the renderer dips the camera when
   // sneaking and widens the FOV when sprinting (local feedback, no latency)
@@ -169,6 +198,12 @@ const Game = (() => {
       else openInventory()
       return
     }
+    if (e.code === 'F5') {
+      // V1.2.0 — third-person camera toggle (vanilla F5 cycles 1st/3rd)
+      e.preventDefault()
+      if (viewToggleCallback) viewToggleCallback()
+      return
+    }
     // While the inventory screen is open every other game key is captured
     // except Escape (close) — vanilla behaves the same.
     if (state.inventoryOpen) {
@@ -244,8 +279,9 @@ const Game = (() => {
   }
 
   /**
-   * Mouse buttons (V1.1.0), only while the pointer is locked:
-   *   left  (button 0) -> mine the targeted block
+   * Mouse buttons, only while the pointer is locked:
+   *   left  (button 0) -> V1.2.0: HELD = keep digging (repeat) / attack mobs;
+   *                      released (mouseup) = STOP digging mid-block
    *   right (button 2)  -> place the held block against the targeted face
    *                        (or "activate" when nothing is held / in hand)
    * The click itself acquires the pointer lock when it is not held yet.
@@ -256,9 +292,27 @@ const Game = (() => {
     e.preventDefault()
     if (!attackCallback) return
     if (e.button === 0) {
-      attackCallback('dig')
+      state.mouseLeftDown = true
+      attackCallback('dig_start')
     } else if (e.button === 2) {
       attackCallback('place')
+    }
+  }
+
+  function onMouseUp (e) {
+    if (!state.active) return
+    if (e.button === 0 && state.mouseLeftDown) {
+      state.mouseLeftDown = false
+      if (attackCallback) attackCallback('dig_stop')
+    }
+  }
+
+  /** Any context where aiming stops (lock lost, chat, inventory, blur)
+   *  must release the held dig — vanilla never keeps mining blind. */
+  function cancelDigHold () {
+    if (state.mouseLeftDown) {
+      state.mouseLeftDown = false
+      if (attackCallback) attackCallback('dig_stop')
     }
   }
 
@@ -274,7 +328,10 @@ const Game = (() => {
 
   function onPointerLockChange () {
     // When lock is lost we stop moving so the bot doesn't run away
-    if (!document.pointerLockElement) resetControls()
+    if (!document.pointerLockElement) {
+      resetControls()
+      cancelDigHold() // V1.2.0 — never keep mining without aiming
+    }
   }
 
   function resetControls () {
@@ -320,6 +377,14 @@ const Game = (() => {
   function tick () {
     if (!state.active) return
     const now = performance.now()
+    // V1.2.0 — held left button: re-emit dig_start every 300 ms (the server
+    // ignores repeats while a dig is in flight; when one block finishes the
+    // next dig_start immediately targets the newly aimed block — vanilla's
+    // continuous mining).
+    if (state.mouseLeftDown && now - (state.lastDigRepeat || 0) >= 300) {
+      state.lastDigRepeat = now
+      if (attackCallback) attackCallback('dig_start')
+    }
     // Look: 20 Hz, independent from controls (aiming is latency-sensitive)
     if (typeof Net !== 'undefined' && Net.isOpen() &&
         now - lastLookSent >= LOOK_SEND_INTERVAL &&
@@ -536,6 +601,8 @@ const Game = (() => {
     document.getElementById('inventory-screen').classList.remove('hidden')
     if (document.pointerLockElement) document.exitPointerLock()
     loadInventoryBg()
+    // V1.2.0 — refresh the craftable recipe list every time the screen opens
+    if (typeof Net !== 'undefined' && Net.isOpen()) Net.send({ t: 'recipes' })
     renderInventory()
   }
 
@@ -547,21 +614,35 @@ const Game = (() => {
 
   /** Builds the DOM slots; REBUILDS them when the background becomes
    *  available (first open may happen before /gui/inventory.png loads).
-   *  Layout: absolute cells over the vanilla panel, or the CSS grid. */
+   *  V1.2.0 FIX: in bg mode the slots are children of the PANEL itself —
+   *  they used to live inside #inventory-grid/#inventory-hotbar whose own
+   *  flow offset shifted every absolute coordinate (the misalignment).
+   *  In grid mode (no bg) the slots stay in their two flex containers. */
   let invDomMode = '' // '' | 'grid' | 'bg'
   function ensureInvDom () {
     const mode = invBgUrl ? 'bg' : 'grid'
     if (invDomMode === mode) return
     invDomMode = mode
+    const panel = document.getElementById('inventory-panel')
     const grid = document.getElementById('inventory-grid')
     const hot = document.getElementById('inventory-hotbar')
     grid.innerHTML = ''
     hot.innerHTML = ''
+    // Remove any previous panel-level slots (bg -> grid switch)
+    for (const el of panel.querySelectorAll(':scope > .inv-slot')) el.remove()
     const useBg = mode === 'bg'
+    const parent = useBg ? panel : null
     // Client inventory indexes: 0-8 = hotbar row (vanilla bottom row),
-    // 9-35 = main grid rendered as 3 rows of 9.
-    for (let i = 9; i < 36; i++) grid.appendChild(buildInvSlotEl(i, useBg))
-    for (let i = 0; i < 9; i++) hot.appendChild(buildInvSlotEl(i, useBg))
+    // 9-35 = main grid rendered as 3 rows of 9. Build in visual order so
+    // tab/DOM order matches the screen.
+    const order = []
+    for (let i = 9; i < 36; i++) order.push(i)
+    for (let i = 0; i < 9; i++) order.push(i)
+    for (const i of order) {
+      const el = buildInvSlotEl(i, useBg)
+      if (useBg) panel.appendChild(el)
+      else (i < 9 ? hot : grid).appendChild(el)
+    }
   }
 
   function buildInvSlotEl (clientIndex, useBg) {
@@ -569,7 +650,8 @@ const Game = (() => {
     el.className = 'inv-slot'
     el.dataset.slot = String(clientIndex)
     if (useBg) {
-      // Absolute cell over the drawn background (vanilla coordinates)
+      // Absolute cell over the drawn background — PANEL-relative (V1.2.0):
+      // vanilla coordinates (7,17) grid rows 0-2, hotbar row at y=75.
       const col = clientIndex % 9
       const isHotbar = clientIndex < 9
       const row = isHotbar ? 0 : Math.floor((clientIndex - 9) / 9)
@@ -580,7 +662,9 @@ const Game = (() => {
       el.style.height = `${INV_CELL}px`
       el.style.background = 'transparent'
       el.style.border = 'none'
+      el.style.boxSizing = 'border-box'
       el.style.padding = `${1 * INV_SCALE}px` // 1px vanilla padding *3
+      el.style.zIndex = '2'
     }
     el.addEventListener('click', onInventorySlotClick)
     return el
@@ -590,17 +674,31 @@ const Game = (() => {
     ensureInvDom()
     const panel = document.getElementById('inventory-panel')
     if (invBgUrl) {
-      // Vanilla panel: background image + absolute slots, title hidden
+      // Vanilla panel: background image + absolute slots, title hidden.
+      // V1.2.0: position:relative on the PANEL — the anchor for the slots.
       panel.classList.add('textured')
+      panel.style.position = 'relative'
       panel.style.backgroundImage = `url(${invBgUrl})`
       panel.style.backgroundSize = `${INV_PANEL_W}px ${INV_PANEL_H}px`
+      panel.style.backgroundRepeat = 'no-repeat'
       panel.style.width = `${INV_PANEL_W}px`
       panel.style.height = `${INV_PANEL_H}px`
       panel.style.padding = '0'
+      panel.style.border = 'none'
       panel.style.borderRadius = '0'
       panel.querySelector('h3').style.display = 'none'
-      document.getElementById('inventory-grid').style.display = 'block'
-      document.getElementById('inventory-hotbar').style.display = 'block'
+      document.getElementById('inventory-grid').style.display = 'none'
+      document.getElementById('inventory-hotbar').style.display = 'none'
+    } else {
+      panel.classList.remove('textured')
+      panel.style.backgroundImage = ''
+      panel.style.width = ''
+      panel.style.height = ''
+      panel.style.padding = ''
+      panel.style.position = ''
+      panel.querySelector('h3').style.display = ''
+      document.getElementById('inventory-grid').style.display = ''
+      document.getElementById('inventory-hotbar').style.display = ''
     }
     const slots = document.querySelectorAll('#inventory-screen .inv-slot')
     for (const el of slots) {
@@ -612,6 +710,7 @@ const Game = (() => {
       el.classList.toggle('in-hotbar', i < 9)
       fillItemEl(el, item, 16 * INV_SCALE)
     }
+    renderCraftPanel()
   }
 
   /** Writes icon + count into a slot element (shared by hotbar & inventory).
@@ -625,13 +724,7 @@ const Game = (() => {
     if (!item) return
     const img = document.createElement('div')
     img.className = 'inv-icon'
-    const iconInfo = getItemIcon(item.name)
-    if (iconInfo) {
-      img.style.backgroundImage = `url(${iconInfo.url})`
-      const tx = (iconInfo.tile % 64) * iconSize
-      const ty = Math.floor(iconInfo.tile / 64) * iconSize
-      img.style.backgroundPosition = `-${tx}px -${ty}px`
-      img.style.backgroundSize = `${64 * iconSize}px ${64 * iconSize}px`
+    if (applyItemIcon(img, item.name, iconSize)) {
       img.style.width = `${iconSize}px`
       img.style.height = `${iconSize}px`
       img.style.position = 'absolute'
@@ -704,6 +797,147 @@ const Game = (() => {
       renderHotbar()
     }
     if (state.inventoryOpen) renderInventory()
+  }
+
+  // ------------------------------------------------------------------
+  // Crafting (V1.2.0) — panel inside the inventory screen (E)
+  // ------------------------------------------------------------------
+
+  // Last recipes list pushed by the server; craftId = its index.
+  let craftRecipes = []
+  let craftSelected = -1
+  let craftNames = {} // numeric ingredient id -> item name
+  let invBlockNames = null // cached id->name table (/blocks.json)
+
+  /** Server 'recipes' push: store + re-render. */
+  function updateRecipes (msg) {
+    if (!Array.isArray(msg.recipes)) return
+    craftRecipes = msg.recipes.slice(0, 120)
+    if (craftSelected >= craftRecipes.length) craftSelected = -1
+    if (state.inventoryOpen) renderCraftPanel()
+  }
+
+  /** Loads /blocks.json once to translate ingredient ids into names. */
+  async function ensureBlockNames () {
+    if (invBlockNames !== null) return
+    try {
+      const res = await fetch('/blocks.json?v=1.21.9')
+      invBlockNames = res.ok ? await res.json() : {}
+    } catch (e) { invBlockNames = {} }
+  }
+
+  /** Ingredient id -> display name. */
+  function ingredientName (id) {
+    if (craftNames[id]) return craftNames[id]
+    const fromBlocks = invBlockNames && invBlockNames[id]
+    if (fromBlocks) { craftNames[id] = fromBlocks; return fromBlocks }
+    return `#${id}`
+  }
+
+  /** How many of `id` the player currently holds (all inventory slots). */
+  function countOwned (id) {
+    let n = 0
+    for (const slot of state.inventory) {
+      if (!slot) continue
+      const slotId = nameToId(slot.name)
+      if (slotId === id) n += slot.count
+    }
+    return n
+  }
+
+  /** Reverse lookup name -> numeric id via the cached table. */
+  function nameToId (name) {
+    if (!invBlockNames) return null
+    for (const k in invBlockNames) {
+      if (invBlockNames[k] === name) return Number(k)
+    }
+    return null
+  }
+
+  /** Renders the craft panel: recipe list + buttons (called by renderInventory). */
+  function renderCraftPanel () {
+    const list = document.getElementById('craft-list')
+    if (!list) return
+    ensureBlockNames()
+    list.innerHTML = ''
+    if (craftRecipes.length === 0) {
+      const empty = document.createElement('div')
+      empty.className = 'craft-empty'
+      empty.textContent = 'Aucune recette avec ton inventaire actuel'
+      list.appendChild(empty)
+    } else {
+      for (const r of craftRecipes) {
+        const entry = document.createElement('div')
+        entry.className = 'craft-entry' + (r.id === craftSelected ? ' selected' : '')
+        // Result icon
+        const icon = document.createElement('div')
+        icon.className = 'craft-result-icon'
+        if (!applyItemIcon(icon, r.result.name, 40)) {
+          icon.classList.add('hotbar-icon-fallback')
+        }
+        entry.appendChild(icon)
+        // Text: result + ingredients (green = owned, red = missing)
+        const text = document.createElement('div')
+        text.className = 'craft-text'
+        const title = document.createElement('div')
+        title.className = 'craft-title'
+        title.textContent = (r.result.count > 1 ? r.result.count + 'x ' : '') + prettyName(r.result.name)
+        text.appendChild(title)
+        const ing = document.createElement('div')
+        ing.className = 'craft-ingredients'
+        for (const [id, count] of Object.entries(r.ingredients || {})) {
+          const owned = countOwned(Number(id))
+          const span = document.createElement('span')
+          span.textContent = `${count} ${prettyName(ingredientName(Number(id)))}`
+          span.className = owned >= count ? 'ok' : 'missing'
+          ing.appendChild(span)
+        }
+        text.appendChild(ing)
+        entry.appendChild(text)
+        if (r.requiresTable) {
+          const badge = document.createElement('div')
+          badge.className = 'craft-table-badge'
+          badge.textContent = 'TABLE'
+          entry.appendChild(badge)
+        }
+        entry.addEventListener('click', () => {
+          craftSelected = r.id
+          renderCraftPanel()
+        })
+        list.appendChild(entry)
+      }
+    }
+    // Buttons
+    const craftBtn = document.getElementById('craft-btn')
+    if (craftBtn) {
+      craftBtn.disabled = craftSelected < 0
+      craftBtn.onclick = () => {
+        if (craftSelected >= 0 && typeof Net !== 'undefined' && Net.isOpen()) {
+          Net.send({ t: 'craft', id: craftSelected, count: 1 })
+        }
+      }
+    }
+    const craftMaxBtn = document.getElementById('craft-max-btn')
+    if (craftMaxBtn) {
+      craftMaxBtn.disabled = craftSelected < 0
+      craftMaxBtn.onclick = () => {
+        if (craftSelected < 0) return
+        const r = craftRecipes[craftSelected]
+        let max = 64
+        for (const [id, count] of Object.entries(r.ingredients || {})) {
+          const possible = Math.floor(countOwned(Number(id)) / count)
+          if (possible < max) max = possible
+        }
+        if (max >= 1 && typeof Net !== 'undefined' && Net.isOpen()) {
+          Net.send({ t: 'craft', id: craftSelected, count: max })
+        }
+      }
+    }
+  }
+
+  /** 'oak_planks' -> 'Oak planks' (display only). */
+  function prettyName (name) {
+    return String(name).replace(/_/g, ' ').replace(/^./, (c) => c.toUpperCase())
   }
 
   function renderHealthHud () {
@@ -780,7 +1014,7 @@ const Game = (() => {
     if (!el) return
     const p = state.position
     el.textContent =
-      `Eaglercraft: Connected Client  |  ${fps} fps\n` +
+      `Mineflayer-WebViewer  |  ${fps} fps\n` +
       `XYZ: ${p.x.toFixed(1)} / ${p.y.toFixed(1)} / ${p.z.toFixed(1)}\n` +
       (extra || '')
   }
@@ -814,6 +1048,8 @@ const Game = (() => {
     document.addEventListener('mousemove', onMouseMove)
     document.addEventListener('pointerlockchange', onPointerLockChange)
     document.addEventListener('mousedown', onMouseDown)
+    document.addEventListener('mouseup', onMouseUp) // V1.2.0 — release = stop dig
+    document.addEventListener('blur', () => cancelDigHold()) // window unfocused
     document.addEventListener('wheel', onWheel, { passive: false })
     document.addEventListener('contextmenu', onContextMenu)
     document.getElementById('game-canvas').addEventListener('click', onCanvasClick)
@@ -828,6 +1064,7 @@ const Game = (() => {
     document.removeEventListener('mousemove', onMouseMove)
     document.removeEventListener('pointerlockchange', onPointerLockChange)
     document.removeEventListener('mousedown', onMouseDown)
+    document.removeEventListener('mouseup', onMouseUp)
     document.removeEventListener('wheel', onWheel)
     document.removeEventListener('contextmenu', onContextMenu)
   }
@@ -841,7 +1078,10 @@ const Game = (() => {
     updateHotbar, updateHotbarSlot, selectHotbarSlot, renderHotbar,
     setItemIconProvider,
     // V1.1.1 — inventory screen (E)
-    updateInventorySlot
+    updateInventorySlot,
+    // V1.2.0 — craft + F5 view toggle
+    updateRecipes,
+    onViewToggle
   }
 })()
 

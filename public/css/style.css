@@ -1,5 +1,5 @@
 /* =========================================================================
-   Eaglercraft: Connected Client — styles (menu & screens)
+   Mineflayer-WebViewer — styles (menu & screens)
    ========================================================================= */
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -261,6 +261,12 @@ input:focus { border-color: var(--accent); }
   display: flex; align-items: center; justify-content: center;
   z-index: 50;
 }
+/* V1.2.0 — inventory panel + craft panel side by side */
+#inventory-layout {
+  display: flex;
+  align-items: flex-start;
+  gap: 18px;
+}
 #inventory-panel {
   background: var(--panel);
   border: 1px solid var(--border);
@@ -268,6 +274,73 @@ input:focus { border-color: var(--accent); }
   padding: 18px 20px 20px;
   box-shadow: 0 20px 60px rgba(0,0,0,.6);
 }
+/* V1.2.0 — crafting panel (right of the inventory) */
+#craft-panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 18px 20px 20px;
+  box-shadow: 0 20px 60px rgba(0,0,0,.6);
+  width: 340px;
+  max-height: 70vh;
+  display: flex; flex-direction: column;
+}
+#craft-panel h3 {
+  margin-bottom: 12px;
+  font-size: 15px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: .5px;
+}
+#craft-list {
+  flex: 1;
+  overflow-y: auto;
+  display: flex; flex-direction: column; gap: 6px;
+  min-height: 120px;
+}
+.craft-empty { color: var(--muted); font-size: 13px; padding: 12px 4px; }
+.craft-entry {
+  display: flex; align-items: center; gap: 10px;
+  background: var(--panel2);
+  border: 2px solid transparent;
+  border-radius: 8px;
+  padding: 8px 10px;
+  cursor: pointer;
+  position: relative;
+}
+.craft-entry:hover { border-color: #777; }
+.craft-entry.selected {
+  border-color: var(--accent);
+  background: rgba(74,158,255,.12);
+}
+.craft-result-icon {
+  width: 40px; height: 40px;
+  flex-shrink: 0;
+  background-repeat: no-repeat;
+  image-rendering: pixelated;
+}
+.craft-text { flex: 1; min-width: 0; }
+.craft-title { font-size: 14px; font-weight: 600; }
+.craft-ingredients {
+  font-size: 12px;
+  display: flex; flex-wrap: wrap; gap: 4px 10px;
+  margin-top: 3px;
+}
+.craft-ingredients .ok { color: #7fd07f; }
+.craft-ingredients .missing { color: var(--danger); }
+.craft-table-badge {
+  position: absolute; top: 6px; right: 8px;
+  font-size: 10px; font-weight: 700;
+  color: #c9a227;
+  border: 1px solid #c9a227;
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+#craft-actions {
+  display: flex; gap: 8px;
+  margin-top: 12px;
+}
+#craft-actions .btn:disabled { opacity: .45; cursor: not-allowed; }
 #inventory-panel h3 {
   margin-bottom: 12px;
   font-size: 15px;

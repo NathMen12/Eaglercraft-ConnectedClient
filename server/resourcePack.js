@@ -39,8 +39,10 @@ const CROSS_BLOCKS = new Set([
 ])
 
 // Blocks that should be rendered semi-transparent
-const TRANSPARENT_BLOCKS = new Set([
-  'glass', 'glass_pane', 'white_stained_glass', 'orange_stained_glass',
+// V1.2.0 — currentAtlasAssetsDir: remembered by buildResourcePack so
+// buildBlockIcon can re-read the pack's texture PNGs (isometric icons).
+let currentAtlasAssetsDir = null
+const TRANSPARENT_BLOCKS = new Set([  'glass', 'glass_pane', 'white_stained_glass', 'orange_stained_glass',
   'magenta_stained_glass', 'light_blue_stained_glass',
   'yellow_stained_glass', 'lime_stained_glass', 'pink_stained_glass',
   'gray_stained_glass', 'light_gray_stained_glass', 'cyan_stained_glass',
@@ -527,6 +529,7 @@ function buildResourcePack (packPath, version) {
   if (!mcData) return null
   const assetsDir = findAssetsDir(packPath)
   if (!assetsDir) return null
+  currentAtlasAssetsDir = assetsDir // V1.2.0 — used by buildBlockIcon
 
   const builder = new AtlasBuilder()
   const stats = { loaded: 0, fallback: 0, resolved: 0 }
@@ -762,6 +765,109 @@ function buildDestroySheet (assetsDir) {
 }
 
 /**
+ * V1.2.0 — renders a 3D isometric icon of a block (32x32 PNG) for the
+ * inventory / hotbar / craft UI: bright top face, medium left face, darker
+ * right face — exactly the vanilla item look. Reads the pack's texture
+ * files through the vanilla pipeline (blockstate -> model -> texture).
+ * Returns a PNG Buffer or null when the block/texture is unknown.
+ */
+function buildBlockIcon (name) {
+  try {
+    if (!currentAtlasAssetsDir) return null
+    const resolver = new VanillaTextureResolver(currentAtlasAssetsDir)
+    const resolved = resolver.resolve(name)
+    const files = resolved
+      ? { side: resolved.side, top: resolved.top }
+      : null
+    if (!files || !files.top || !files.side) return null
+    const readTex = (rel) => {
+      const p = path.join(currentAtlasAssetsDir, 'minecraft', 'textures', rel.replace(/^textures\//, '') + '.png')
+      if (!fs.existsSync(p)) return null
+      try { return PNG.sync.read(fs.readFileSync(p)) } catch (e) { return null }
+    }
+    const top = readTex(files.top)
+    const side = readTex(files.side)
+    if (!top || !side) return null
+    // V1.2.0 — biome tint for the icon's TOP face (grass_block/leaves...):
+    // same colormap sampling as the chunk streamer, plains by default
+    // (temperature .8 / downfall .4) so the icon matches what the player
+    // sees in the world instead of the pack's grayscale colormap texture.
+    const GRASS = new Set(['grass_block', 'short_grass', 'tall_grass', 'fern', 'large_fern', 'grass', 'sugar_cane', 'vines', 'vine', 'lily_pad'])
+    const FOLIAGE = new Set(['oak_leaves', 'spruce_leaves', 'birch_leaves', 'jungle_leaves', 'acacia_leaves', 'dark_oak_leaves', 'mangrove_leaves', 'cherry_leaves', 'azalea_leaves', 'flowering_azalea_leaves', 'pale_oak_leaves'])
+    let topTint = null
+    if (GRASS.has(name) || FOLIAGE.has(name)) {
+      const kind = GRASS.has(name) ? 1 : 2
+      try {
+        const mapPath = path.join(currentAtlasAssetsDir, 'minecraft', 'textures', 'colormap',
+          kind === 1 ? 'grass.png' : 'foliage.png')
+        if (fs.existsSync(mapPath)) {
+          const map = PNG.sync.read(fs.readFileSync(mapPath))
+          const t = 0.8; const d = 0.4 // plains
+          const mx = Math.min(map.width - 1, Math.floor((1 - t) * (map.width - 1)))
+          const my = Math.min(map.height - 1, Math.floor((1 - d) * (map.height - 1)))
+          const i = (my * map.width + mx) * 4
+          topTint = [map.data[i], map.data[i + 1], map.data[i + 2]]
+        }
+      } catch (e) { topTint = null }
+    }
+    const tintPix = (rgba, tint) => rgba.map((c, i) => i === 3 ? c : Math.min(255, Math.round((c * tint[i]) / 255)))
+    // 32x32 canvas, iso cube ~26px wide
+    const W = 32
+    const H = 32
+    const img = new PNG({ width: W, height: H, colorType: 6 })
+    const put = (x, y, r, g, b, a) => {
+      x = Math.round(x); y = Math.round(y)
+      if (x < 0 || y < 0 || x >= W || y >= H) return
+      const i = (y * W + x) * 4
+      img.data[i] = r; img.data[i + 1] = g; img.data[i + 2] = b; img.data[i + 3] = a
+    }
+    const tex = (png, u, v) => {
+      const px = png.data[((Math.min(png.height - 1, v | 0)) * png.width + (Math.min(png.width - 1, u | 0))) * 4]
+      return [png.data[px], png.data[px + 1], png.data[px + 2], png.data[px + 3]]
+    }
+    const sample = (png, su, sv) => {
+      const u = Math.min(png.width - 1, Math.floor(su * png.width))
+      const v = Math.min(png.height - 1, Math.floor(sv * png.height))
+      const i = (v * png.width + u) * 4
+      return [png.data[i], png.data[i + 1], png.data[i + 2], png.data[i + 3]]
+    }
+    // Geometry: top diamond from (16,3) to (29,9.5) to (16,16) to (3,9.5);
+    // left face (3,9.5)-(16,16)-(16,29)-(3,22.5); right face mirrored.
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        // TOP face: diamond
+        const dxT = (x - 16) / 13
+        const dyT = (y - 9.5) / 6.5
+        if (Math.abs(dxT) + Math.abs(dyT) <= 1) {
+          let [r, g, b, a] = sample(top, (dxT + 1) / 2, (dyT + 1) / 2)
+          if (topTint) [r, g, b] = tintPix([r, g, b], topTint) // green icon
+          put(x, y, r, g, b, a)
+          continue
+        }
+        // LEFT face (west): x in [3,16], parallelogram
+        const dxL = (x - 3) / 13
+        const dyL = (y - 9.5 - dxL * 6.5) / 13
+        if (dxL >= 0 && dxL <= 1 && dyL >= 0 && dyL <= 1) {
+          const [r, g, b, a] = sample(side, dxL, dyL)
+          put(x, y, Math.round(r * 0.8), Math.round(g * 0.8), Math.round(b * 0.8), a)
+          continue
+        }
+        // RIGHT face (south): x in [16,29]
+        const dxR = (x - 16) / 13
+        const dyR = (y - 16 + dxR * 6.5) / 13
+        if (dxR >= 0 && dxR <= 1 && dyR >= 0 && dyR <= 1) {
+          const [r, g, b, a] = sample(side, dxR, dyR)
+          put(x, y, Math.round(r * 0.6), Math.round(g * 0.6), Math.round(b * 0.6), a)
+        }
+      }
+    }
+    return PNG.sync.write(img)
+  } catch (e) {
+    return null
+  }
+}
+
+/**
  * V1.1.2 — inventory screen background. Modern packs (1.21+) ship GUI as
  * separate sprites with no container/inventory.png, so we DRAW a vanilla-
  * style panel: the classic #c6c6c6 grey, 3D bevel borders and 36 slot
@@ -826,6 +932,7 @@ module.exports = {
   buildItemAtlas,
   buildDestroySheet,
   buildInventoryBackground,
+  buildBlockIcon,
   ensureResourcePack,
   findAssetsDir,
   VanillaTextureResolver,

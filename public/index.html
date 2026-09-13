@@ -3,15 +3,15 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Eaglercraft : Connected Client</title>
+  <title>Mineflayer-WebViewer</title>
   <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
   <!-- ================= MENU SCREEN ================= -->
   <div id="menu-screen" class="screen active">
     <div class="menu-panel">
-      <h1 class="title">Eaglercraft</h1>
-      <h2 class="subtitle">Connected Client</h2>
+      <h1 class="title">Mineflayer</h1>
+      <h2 class="subtitle">WebViewer</h2>
 
       <div class="menu-section">
         <label for="username-input">Pseudo</label>
@@ -78,11 +78,22 @@
 
       <!-- V1.1.1 — Inventory screen (E key): main grid + hotbar row -->
       <div id="inventory-screen" class="hidden">
-        <div id="inventory-panel">
-          <h3>Inventaire</h3>
-          <div id="inventory-grid"></div>
-          <div id="inventory-separator"></div>
-          <div id="inventory-hotbar"></div>
+        <div id="inventory-layout">
+          <div id="inventory-panel">
+            <h3>Inventaire</h3>
+            <div id="inventory-grid"></div>
+            <div id="inventory-separator"></div>
+            <div id="inventory-hotbar"></div>
+          </div>
+          <!-- V1.2.0 — Crafting panel -->
+          <div id="craft-panel">
+            <h3>Craft</h3>
+            <div id="craft-list"></div>
+            <div id="craft-actions">
+              <button id="craft-btn" class="btn small primary" disabled>Crafter</button>
+              <button id="craft-max-btn" class="btn small" disabled>Crafter max</button>
+            </div>
+          </div>
         </div>
       </div>
     </div>

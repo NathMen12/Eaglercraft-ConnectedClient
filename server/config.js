@@ -1,7 +1,7 @@
 'use strict'
 
 /**
- * Eaglercraft: Connected Client — server configuration.
+ * Mineflayer-WebViewer — server configuration.
  *
  * The server is designed to run on a small box (1 core / 2.5 GB RAM),
  * so every tunable is conservative by default and can be overridden
